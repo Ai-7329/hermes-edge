@@ -1,0 +1,196 @@
+"""Regression tests for the mechanical (LLM-free) context engine.
+
+The failure mode this engine exists to kill: auto-compaction summarizes with
+an auxiliary LLM at the moment the context is fullest; on a slow/single-slot
+local backend every summary attempt times out, timeouts abort compaction
+(nothing dropped), and the session livelocks compress→timeout→compress.
+These tests pin the two structural properties that make that impossible here:
+compaction never touches an LLM, and the summary can never be None.
+"""
+
+import json
+
+import pytest
+
+import agent.context_compressor as cc_mod
+from plugins.context_engine import load_context_engine
+
+
+@pytest.fixture()
+def engine(monkeypatch):
+    def _boom(*args, **kwargs):  # tripwire: any LLM call fails the test
+        raise AssertionError("LLM was called during mechanical compaction")
+    monkeypatch.setattr(cc_mod, "call_llm", _boom)
+    eng = load_context_engine("mechanical")
+    assert eng is not None, "mechanical engine failed to load via plugin loader"
+    eng.update_model(model="test-model", context_length=131072)
+    return eng
+
+
+def _tool_call(cid, name, **args):
+    return {"id": cid, "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args)}}
+
+
+def _session(n_probe_repeats=4):
+    """Synthetic session shaped like the real livelock: one instruction,
+    then repeated identical blocked probes.
+
+    Shape matters: the first 3 non-system messages sit in the protected
+    head and the last ~5 in the protected tail (both stay live, correctly
+    absent from any digest), so the contract turn and the probe cluster
+    are placed in the compressible middle.
+    """
+    msgs = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "おはよう"},
+        {"role": "assistant", "content": "おはようございます。"},
+        {"role": "assistant", "content": "準備完了。" + "前置き。" * 30},
+        # ---- head boundary (system + 3 non-system) ----
+        {"role": "user", "content": "モデルを調査して、仮説→検証でアイデア提案まで。"},
+        {"role": "assistant", "content": "調査計画を立てた。" + "手順の説明。" * 40},
+    ]
+    for i in range(n_probe_repeats):
+        msgs.append({"role": "assistant", "content": "",
+                     "tool_calls": [_tool_call(f"c{i}", "terminal",
+                                               command="python3 -c 'import pandas'")]})
+        msgs.append({"role": "tool", "tool_call_id": f"c{i}",
+                     "content": json.dumps({"output": "", "exit_code": -1,
+                                            "error": "BLOCKED: approval timed out"})})
+    # ---- enough trailing turns that the protected tail stays behind the probes ----
+    for j in range(3):
+        msgs.append({"role": "assistant", "content": f"別経路の検討 {j}。" + "詳細。" * 60})
+    msgs.append({"role": "user", "content": "続けて"})
+    msgs.append({"role": "assistant", "content": "続行する。" + "内容。" * 60})
+    return msgs
+
+
+def test_compaction_without_llm(engine):
+    """compress() completes with call_llm tripwired — the livelock's entry
+    point (summary timeout) is structurally unreachable."""
+    msgs = _session()
+    engine.tail_token_budget = 60
+    engine.protect_last_n = 3
+    out = engine.compress(msgs, current_tokens=100_000)
+    digests = [m for m in out
+               if m.get("content") and cc_mod.SUMMARY_PREFIX in str(m["content"])]
+    assert len(digests) == 1
+    assert len(out) < len(msgs)
+
+
+def test_digest_preserves_contracts_and_probe_repetition(engine):
+    msgs = _session()
+    engine.tail_token_budget = 60
+    engine.protect_last_n = 3
+    out = engine.compress(msgs, current_tokens=100_000)
+    digest = next(str(m["content"]) for m in out
+                  if m.get("content") and cc_mod.SUMMARY_PREFIX in str(m["content"]))
+    # user turn verbatim (contract — originates outside the model)
+    assert "モデルを調査して、仮説→検証でアイデア提案まで。" in digest
+    # the blocked probe is visible with its outcome and repeat count
+    assert "python3 -c 'import pandas'" in digest
+    assert "BLOCKED" in digest
+    assert "×4 runs" in digest
+
+
+def test_generate_summary_never_none(engine):
+    """None would resurrect the abort/fallback/cooldown failure paths."""
+    assert engine._generate_summary([]) is not None
+    # even on a poisoned window the engine must emit a counting stub
+    poisoned = [{"role": "assistant", "tool_calls": [object()], "content": None}]
+    out = engine._generate_summary(poisoned)
+    assert out is not None and cc_mod.SUMMARY_PREFIX in out
+
+
+def test_recompression_merges_own_digest_without_nesting(engine):
+    engine.tail_token_budget = 60
+    engine.protect_last_n = 3
+    out1 = engine.compress(_session(), current_tokens=100_000)
+    # grow the tail and compress again
+    grown = list(out1)
+    for i in range(10):
+        grown.append({"role": "assistant", "content": f"追加の報告 {i}。" + "x" * 200})
+    grown.append({"role": "user", "content": "さらに続けて"})
+    grown.append({"role": "assistant", "content": "承知。" + "y" * 300})
+    out2 = engine.compress(grown, current_tokens=100_000)
+    digests = [m for m in out2
+               if m.get("content") and cc_mod.SUMMARY_PREFIX in str(m["content"])]
+    assert len(digests) == 1
+    d2 = str(digests[0]["content"])
+    # exactly one generator marker → previous digest merged, not nested
+    assert d2.count("# mechanical context digest") == 1
+    # round-1 contract survives the merge
+    assert "モデルを調査して、仮説→検証でアイデア提案まで。" in d2
+
+
+def test_tool_pairs_stay_well_formed(engine):
+    engine.tail_token_budget = 60
+    engine.protect_last_n = 3
+    out = engine.compress(_session(), current_tokens=100_000)
+    call_ids = {tc.get("id") for m in out if m.get("role") == "assistant"
+                for tc in m.get("tool_calls") or []}
+    orphans = [m for m in out if m.get("role") == "tool"
+               and m.get("tool_call_id") not in call_ids]
+    assert orphans == []
+
+
+def _render_in_thread(engine, users, spine, tools, focus_topic):
+    """Run _render on a daemon thread so a shrink-loop regression fails the
+    test instead of hanging the whole suite."""
+    import threading
+    result = {}
+
+    def _run():
+        result["body"] = engine._render(
+            users, spine, tools, position="tail position",
+            legacy_block="", n_turns=1, focus_topic=focus_topic,
+        )
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=20)
+    assert not t.is_alive(), "_render did not terminate (shrink-loop livelock)"
+    return result["body"]
+
+
+def test_render_terminates_when_focus_pins_every_line(engine):
+    """All-pinned sections once made _elide a no-op: the budget loop had no
+    progress guarantee and spun forever — a livelock inside the engine that
+    exists to remove a livelock."""
+    users = [f"- 「probe request {i} : " + "u" * 150 + "」" for i in range(60)]
+    spine = [f"- probe report {i} : " + "s" * 200 for i in range(40)]
+    tools = [f"- terminal `probe cmd {i}` → exit 0" for i in range(60)]
+    engine.max_summary_tokens = 1000  # char budget floor: 4000
+    body = _render_in_thread(engine, users, spine, tools, focus_topic="probe")
+    assert len(body) <= 4000 + 50  # budget + hard-cut suffix
+
+
+def test_render_terminates_at_section_floors_without_focus(engine):
+    """Small summary budgets (tiny-context models) can leave the body above
+    budget with every section at its floor; the loop must fall through to
+    the hard cut instead of re-eliding a floor-sized list forever."""
+    users = [f"- 「turn {i} : " + "u" * 370 + "」" for i in range(60)]
+    spine = [f"- report {i} : " + "s" * 200 for i in range(40)]
+    tools = [f"- terminal `cmd {i}` → exit 0, output 3 chars" for i in range(60)]
+    engine.max_summary_tokens = 1000
+    body = _render_in_thread(engine, users, spine, tools, focus_topic=None)
+    assert len(body) <= 4000 + 50
+
+
+def test_placeholder_lines_do_not_accumulate_across_digests(engine):
+    """'(none in this window)' is a rendering artifact; on self-merge it must
+    not be re-ingested as a real item next to genuine content."""
+    w1 = []
+    for i in range(3):
+        w1.append({"role": "assistant", "content": "",
+                   "tool_calls": [_tool_call(f"p{i}", "terminal", command=f"ls {i}")]})
+        w1.append({"role": "tool", "tool_call_id": f"p{i}",
+                   "content": json.dumps({"output": "ok", "exit_code": 0})})
+    d1 = engine._generate_summary(w1)
+    assert "(none in this window)" in d1
+    w2 = [{"role": "user", "content": "real user turn"},
+          {"role": "assistant", "content": "real assistant report " + "r" * 150}]
+    d2 = engine._generate_summary(w2)
+    user_sec = d2.split("## User turns", 1)[1].split("## ", 1)[0]
+    assert "real user turn" in user_sec
+    assert "- (none in this window)" not in user_sec

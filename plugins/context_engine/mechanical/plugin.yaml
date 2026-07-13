@@ -1,0 +1,7 @@
+name: mechanical
+description: >-
+  Compaction without an LLM call: the summary is a deterministic mechanical
+  extraction (user turns verbatim, assistant report spine, deduplicated tool
+  index with repeat counts, current position). Removes the
+  summary-timeout/livelock failure mode of LLM summarization on slow or
+  single-slot local backends. Select with context.engine: mechanical.
