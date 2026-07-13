@@ -61,6 +61,47 @@ Costs below are Lean-checked arithmetic on the profile shapes:
 | 25 (older desktop, 7-14B) | 69 s | ≈ 317 s | 16384 |
 | 10 (N100/SBC-class, 4-8B) | 171 s | 4,228 tok ≈ 423 s at budget 8192 — header size becomes the dominant term; shrink toolsets further / keep `tool_search` on | 8192 |
 
+## Measured: 35B-A3B inside an 8 GB memory ceiling
+
+Can the 19.6 GB model run on an 8 GB-class box at all? Measured, not
+argued: aarch64 Linux VM, cgroup limit **7 GiB with swap denied**
+(`--memory 7g --memory-swap 7g`, the ~8.2 GB VM plays the role of the
+whole box), CPU-only, weights on a **native ext4 volume**, `--no-repack`,
+default mmap. The OS page cache — charged against the same 7 GiB — is the
+only expert-caching mechanism (colibri's hierarchy, degenerate form,
+zero new code):
+
+| Metric | Measured |
+|---|---|
+| Decode | **2.2–3.2 tok/s** (23-token and 7-token runs) |
+| Prefill, amortized | **7.6 tok/s** (792-token prompt, 131.8 ms/tok) |
+| Prefill, tiny prompt | 2.1 tok/s (12 tokens — no batch amortization) |
+| Cold model start | minutes-class (~104 s for load+792-tok prefill, warm-ish cache) |
+| OOM without `--no-repack` | confirmed (`oom_kill 1`) — repack materializes weights in RAM |
+
+Operational conclusions for an 8 GB deployment:
+
+1. **It runs, unattended-agent shaped.** Answer-in-minutes monitoring/
+   automation is viable; interactive chat is not the use case. Profile:
+   `prefill_tps: 7`, `budget_tokens: 4096`, minimal toolsets, tool_output
+   ≤ 4 KB. A 4–8B dense model (fully resident, ~15–40 tok/s CPU) remains
+   the pragmatic interactive choice on this class — both are now measured
+   options, not guesses.
+2. **`--no-repack` is mandatory** below weight size: ARM repack rebuilds
+   tensors in anonymous RAM and the cgroup kills the process.
+3. **The model must sit on a local filesystem.** A FUSE/network mount
+   (virtiofs here; NFS on a factory floor) breaks mmap readahead — 4 KB
+   page-fault reads, observed at ~270 KB/s effective: hours per load.
+   Moving the same file to native ext4 turned it into the numbers above.
+4. Page-cache LRU already captures the A3B hot-expert set well enough for
+   the band above; colibri-style learned expert pinning is an
+   *optimization* on top (fork candidate: per-expert mlock), not a
+   prerequisite.
+
+Caveats: virtualized I/O and aarch64 NEON (a real x86 edge box with local
+NVMe differs in both directions); decode samples are short; multi-hour
+steady-state churn unmeasured.
+
 ## Live end-to-end run (real model, real server)
 
 Executed on an M1 Pro 32GB against llama-server (35B-A3B MoE Q4_K_M,
