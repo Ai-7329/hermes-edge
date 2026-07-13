@@ -1,0 +1,121 @@
+# hermes-edge profile — long-running agent on a low-spec shared box.
+#
+# Target shape: one OpenAI-compatible local server (llama.cpp / llama-server)
+# on the same machine, prefill tens of tok/s, decode 15-30 tok/s, hybrid or
+# SWA attention (prefix cache restores from checkpoints only), and the box is
+# ALSO doing other work — the agent must be a polite tenant, not a landlord.
+#
+# Copy into ~/.hermes/profiles/<name>/config.yaml and adjust the placeholders
+# marked CHANGEME. Pair with scripts/llama-server-edge.sh (or .bat) so the
+# server side carries its half of the contract.
+
+model:
+  default: "CHANGEME-model-alias"      # must match llama-server --alias exactly
+  provider: "custom"
+  base_url: "http://127.0.0.1:8080/v1" # /v1 required
+  api_key: "not-needed"                # match --api-key if you set one
+  context_length: 131072               # MUST equal the server's --ctx-size
+
+# Pin the main conversation to one server slot so its prefix cache and
+# checkpoints survive other traffic. Requires a llama.cpp build that binds
+# slots by request cache_key (e.g. llama-cpp-turboquant; upstream builds
+# without it simply ignore the field).
+custom_providers:
+  - name: "local-llama"
+    base_url: "http://127.0.0.1:8080/v1"
+    extra_body:
+      cache_key: "hermes-main"
+
+# ── The four failure modes this profile closes ─────────────────────────
+#
+# 1. Fixed header re-prefilled every turn  -> trim toolsets + tool_search,
+#    slot pinning + server cache flags keep the prefix warm.
+# 2. Auxiliary calls dying at 30s          -> single_flight gate + prefill-
+#    aware floors; deferrable features skip instead of queueing.
+# 3. Aux traffic evicting main cache       -> cache_key pinning + gate;
+#    optionally point auxiliary.* at a second small-model server.
+# 4. Tool output flooding history          -> tool_output caps (a 50KB cap
+#    is ~16K tokens = ~5 min of prefill at 50 tok/s; 6KB is ~35s).
+
+local_runtime:
+  single_flight: true        # one in-flight request per local endpoint
+  prefill_tps: 50            # CHANGEME: measured prompt-processing tok/s
+  decode_budget: 900         # max expected generation seconds per call
+  timeout_margin: 30
+  gate_wait_timeout: 900     # main conversation: max wait for the gate
+  busy_skip_wait: 15         # deferrable aux: give up quickly, skip HTTP
+  compression_warmup: true   # re-prefill compacted prompt in idle time
+
+context:
+  engine: mechanical         # LLM-free compaction (no summary call at all)
+
+compression:
+  enabled: true
+  threshold: 0.50
+  target_ratio: 0.20
+  protect_first_n: 3
+  protect_last_n: 20
+  # Working-set cap: compaction triggers at budget_tokens x threshold
+  # (16384 here), so every planned re-prefill stays ~2 min at 50 tok/s
+  # instead of ~30 min when riding a 131K window to its default trigger.
+  budget_tokens: 32768
+
+agent:
+  max_turns: 150
+  api_max_retries: 1         # a timeout retry re-sends the full prompt
+  reasoning_effort: medium
+
+tool_output:
+  max_bytes: 6000            # ~2K tokens ≈ 35-40s of prefill per tool call
+  max_lines: 300
+  max_line_length: 2000
+
+tools:
+  tool_search: { enabled: "on", threshold_pct: 2 }
+
+# Keep the injected tool schema small: every toolset costs header tokens on
+# EVERY turn. Start minimal; add toolsets when a workflow actually needs them.
+platform_toolsets:
+  cli:
+    - terminal
+    - file
+    - todo
+    - skills
+    - memory
+
+auxiliary:
+  # Deferrable features skip when the server is busy (gate) — but on a
+  # one-server box the honest configuration is to disable what you don't
+  # use and give the rest realistic deadlines.
+  title_generation:
+    enabled: false           # edge fork switch; upstream had no off switch
+  compression:
+    provider: main
+    timeout: 600             # floor also applies via local_runtime.prefill_tps
+  # To offload aux work entirely, run a second small-model server and point
+  # features at it (per-feature provider/model/base_url are honored):
+  #   flush_memories:
+  #     provider: custom
+  #     base_url: "http://127.0.0.1:8081/v1"
+  #     model: "CHANGEME-small-alias"
+  #     timeout: 120
+
+memory:
+  memory_enabled: true
+  nudge_interval: 0          # no periodic memory-review nudges
+  flush_min_turns: 0
+
+curator:
+  enabled: false             # weekly LLM curation pass — off on shared boxes
+
+approvals:
+  mode: manual
+  timeout: 60                # unattended timeout reports deny_timeout (fork fix)
+
+display:
+  streaming: true
+  show_reasoning: true
+
+sessions:
+  auto_prune: true           # long-running boxes: keep the session DB bounded
+  retention_days: 90
