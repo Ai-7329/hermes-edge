@@ -1282,7 +1282,15 @@ class AIAgent:
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
-            return float("inf")
+            # Bounded when the backend's prefill speed is configured
+            # (local_runtime.prefill_tps) so unattended sessions detect a
+            # wedged server; otherwise the upstream unbounded behavior.
+            from agent.chat_completion_helpers import estimate_request_context_tokens
+            from agent.local_runtime import bounded_local_stale_seconds
+            _local_bound = bounded_local_stale_seconds(
+                base_url, estimate_request_context_tokens(api_payload)
+            )
+            return _local_bound if _local_bound is not None else float("inf")
 
         from agent.chat_completion_helpers import estimate_request_context_tokens
         est_tokens = estimate_request_context_tokens(api_payload)

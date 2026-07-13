@@ -173,6 +173,8 @@ def _openai_http_client_kwargs(
 
 
 def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
+    from agent.local_runtime import gate_openai_client
+
     kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
     # Hermes owns auxiliary retry + provider/model fallback policy (the
     # same-provider transient retry in call_llm plus the except-chain
@@ -183,7 +185,12 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
     # by default and let Hermes control the budget; explicit callers can still
     # override via kwargs.
     kwargs.setdefault("max_retries", 0)
-    return OpenAI(api_key=api_key, base_url=base_url, **kwargs)
+    # Single-flight gate for governed local endpoints (no-op elsewhere):
+    # auxiliary traffic must never race the main conversation for the local
+    # server's slots/prefix cache. See agent/local_runtime.py.
+    return gate_openai_client(
+        OpenAI(api_key=api_key, base_url=base_url, **kwargs), base_url
+    )
 
 
 # ── Interrupt protection for atomic auxiliary tasks ──────────────────────
@@ -6428,6 +6435,12 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    # Label this thread's LLM traffic with the auxiliary task so the
+    # endpoint gate (agent/local_runtime.py) can apply queue-vs-skip policy
+    # and attribute waits in logs.
+    from agent.local_runtime import local_aux_timeout_floor, set_task_label
+    set_task_label(task or "call")
+
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
@@ -6502,10 +6515,18 @@ def call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = _effective_aux_timeout(task, timeout)
-
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
+
+    effective_timeout = _effective_aux_timeout(task, timeout)
+    # Local endpoints: a static deadline smaller than the request's own
+    # prefill time is a guaranteed loss that still costs the server a full
+    # prefill. Floor the (config-derived) deadline at the prefill-aware
+    # bound; explicit per-call timeouts stay authoritative.
+    if timeout is None:
+        _local_floor = local_aux_timeout_floor(_base_info or resolved_base_url, messages)
+        if _local_floor is not None:
+            effective_timeout = max(effective_timeout, _local_floor)
     if task:
         logger.info("Auxiliary %s: using %s (%s)%s",
                      task, resolved_provider or "auto", final_model or "default",

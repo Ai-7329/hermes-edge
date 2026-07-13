@@ -237,6 +237,19 @@ def _check_stale_giveup(agent) -> None:
 
 
 def interruptible_api_call(agent, api_kwargs: dict):
+    """Single-flight-gated entry — see ``_interruptible_api_call_impl``.
+
+    The gate (``agent.local_runtime``) serializes requests against governed
+    local endpoints so auxiliary traffic cannot evict the main conversation's
+    server-side prefix cache mid-turn. No-op for cloud providers or when
+    ``local_runtime.single_flight`` is off.
+    """
+    from agent.local_runtime import endpoint_gate
+    with endpoint_gate(getattr(agent, "base_url", "") or "", purpose="main"):
+        return _interruptible_api_call_impl(agent, api_kwargs)
+
+
+def _interruptible_api_call_impl(agent, api_kwargs: dict):
     """
     Run the API call in a background thread so the main conversation loop
     can detect interrupts without waiting for the full HTTP round-trip.
@@ -1855,6 +1868,20 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 
 def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+    """Single-flight-gated entry — see ``_interruptible_streaming_api_call_impl``.
+
+    Held for the full stream lifetime (prefill + generation), released on
+    return or raise. Reentrant per thread, so the internal fallbacks into the
+    non-streaming path re-enter the same gate without deadlocking.
+    """
+    from agent.local_runtime import endpoint_gate
+    with endpoint_gate(getattr(agent, "base_url", "") or "", purpose="main"):
+        return _interruptible_streaming_api_call_impl(
+            agent, api_kwargs, on_first_delta=on_first_delta
+        )
+
+
+def _interruptible_streaming_api_call_impl(agent, api_kwargs: dict, *, on_first_delta=None):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
     Handles all three api_modes:
@@ -2081,6 +2108,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # overrode HERMES_STREAM_READ_TIMEOUT.
             if _stream_read_timeout == 120.0 and agent.base_url and is_local_endpoint(agent.base_url):
                 _stream_read_timeout = _base_timeout
+                # A prefill-aware stale bound (local_runtime.prefill_tps) can
+                # legitimately exceed the base read timeout on huge prompts;
+                # keep the socket read timeout in step so it never preempts
+                # the stale detector (same rule as the cloud-reasoning case
+                # below).
+                if (
+                    _stream_stale_timeout is not None
+                    and _stream_stale_timeout != float("inf")
+                    and _stream_stale_timeout > _stream_read_timeout
+                ):
+                    _stream_read_timeout = _stream_stale_timeout
                 logger.debug(
                     "Local provider detected (%s) — stream read timeout raised to %.0fs",
                     agent.base_url, _stream_read_timeout,
@@ -2899,8 +2937,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # for prefill on large contexts.  Disable the stale detector unless
     # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
     if _stream_stale_timeout_base == 180.0 and agent.base_url and is_local_endpoint(agent.base_url):
-        _stream_stale_timeout = float("inf")
-        logger.debug("Local provider detected (%s) — stale stream timeout disabled", agent.base_url)
+        # Unbounded is right for interactive use but wrong for unattended
+        # long-running operation: a wedged local server must be detected in
+        # bounded time. With a measured prefill_tps the bound is computable
+        # (full prefill of this request + decode budget); without it, keep
+        # the upstream behavior.
+        from agent.local_runtime import bounded_local_stale_seconds
+        _local_bound = bounded_local_stale_seconds(
+            agent.base_url, estimate_request_context_tokens(api_kwargs)
+        )
+        if _local_bound is not None:
+            _stream_stale_timeout = _local_bound
+            logger.debug(
+                "Local provider detected (%s) — stale stream timeout bounded at %.0fs "
+                "by local_runtime.prefill_tps", agent.base_url, _local_bound,
+            )
+        else:
+            _stream_stale_timeout = float("inf")
+            logger.debug("Local provider detected (%s) — stale stream timeout disabled", agent.base_url)
     else:
         # Scale the stale timeout for large contexts: slow models (like Opus)
         # can legitimately think for minutes before producing the first token
