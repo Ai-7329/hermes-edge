@@ -29,6 +29,20 @@ PORT="${PORT:-8080}"
 THREADS_DECODE="${THREADS_DECODE:-6}"
 THREADS_PREFILL="${THREADS_PREFILL:-14}"
 
+# COEXIST=1 — leave ~half the machine for other work. Measured cost (M1 Pro,
+# full-RAM CPU decode): halving threads cost decode −16% and IMPROVED prefill
+# +15% (efficiency-core spill and cross-process contention disappear) —
+# decode's wall is memory bandwidth, not cores. RAM already shares
+# gracefully: weights are mmap'd and never mlocked, so the OS reclaims pages
+# for other processes and inference degrades toward the measured paging
+# floor instead of OOMing. For GPU sharing, lower -ngl until `nvidia-smi`
+# shows the VRAM you want free — CUDA time-slices compute automatically.
+if [ "${COEXIST:-0}" = "1" ]; then
+  THREADS_DECODE=$(( THREADS_DECODE / 2 < 2 ? 2 : THREADS_DECODE / 2 ))
+  THREADS_PREFILL=$(( THREADS_PREFILL / 2 < 2 ? 2 : THREADS_PREFILL / 2 ))
+  NICE_LEVEL="${NICE_LEVEL:-15}"
+fi
+
 exec nice -n "${NICE_LEVEL:-5}" "$LLAMA_SERVER" \
   --model "$MODEL_PATH" \
   --alias "$ALIAS" \

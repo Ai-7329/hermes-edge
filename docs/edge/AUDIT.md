@@ -102,6 +102,27 @@ Caveats: virtualized I/O and aarch64 NEON (a real x86 edge box with local
 NVMe differs in both directions); decode samples are short; multi-hour
 steady-state churn unmeasured.
 
+## Measured: the cost of leaving half the machine free
+
+Coexistence claim (the agent as tenant, not landlord) quantified: same
+35B-A3B, full-RAM CPU inference, 727-token prompt, measured on a machine
+that was simultaneously running other work — which is the point:
+
+| Threads | Prefill | Decode |
+|---|---|---|
+| 8 | 32.9 tok/s | 16.7 tok/s |
+| 4 (half) | **37.8 tok/s (+15%)** | 14.0 tok/s (−16%) |
+
+Halving the CPU allocation costs 16% of decode and *improved* prefill —
+threads spilling onto efficiency cores and cross-process contention hurt
+more than the lost cores helped. Decode's wall is memory bandwidth, not
+core count, so a half-machine allocation is nearly free. `COEXIST=1` in
+the launch scripts applies this (half threads + lower priority); RAM
+shares automatically (mmap, no mlock — under pressure inference degrades
+toward the measured 7-GiB paging floor instead of OOMing), and GPU
+headroom is set by lowering `-ngl` until `nvidia-smi` shows the desired
+free VRAM (CUDA time-slices compute between processes on its own).
+
 ## Live end-to-end run (real model, real server)
 
 Executed on an M1 Pro 32GB against llama-server (35B-A3B MoE Q4_K_M,
