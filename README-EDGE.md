@@ -99,6 +99,15 @@ hanging forever.
 - Warmup byte-fidelity is best-effort (it mirrors the main loop's message
   scrub); divergence costs one wasted idle prefill, never a wrong prompt.
 
+## Formal audit
+
+`docs/edge/AUDIT.md` answers "is this actually edge-fit?" item by item:
+the design arithmetic and gate decision table are machine-checked in Lean 4
+(`docs/edge/audit/EdgeAudit.lean` — core only, `lean EdgeAudit.lean` exits 0),
+each theorem is pinned to the implementation by a named pytest, and the
+footprint/offline claims are measured (import RSS 93 MB, core install
+64 packages / 195 MB, zero unconditional outbound on CLI launch).
+
 ## Relationship to upstream
 
 MIT, © Nous Research (see `LICENSE`). Branch layout: `main` mirrors
