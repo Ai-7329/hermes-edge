@@ -5687,6 +5687,13 @@ class AIAgent:
                 set_task_label,
             )
 
+            # Grace period: after a PREFLIGHT compaction the real call follows
+            # within milliseconds — it must win the gate, not queue behind an
+            # opportunistic warmup (observed live: main waited 26s for a
+            # warmup whose bytes then diverged). Two idle seconds cost the
+            # post-response case nothing and let the imminent-call case turn
+            # into a clean skip-when-busy.
+            time.sleep(2.0)
             set_task_label("compression_warmup")
             client = None
             try:

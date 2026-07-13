@@ -28,8 +28,9 @@ custom_providers:
 
 # ── The four failure modes this profile closes ─────────────────────────
 #
-# 1. Fixed header re-prefilled every turn  -> trim toolsets + tool_search,
-#    slot pinning + server cache flags keep the prefix warm.
+# 1. Fixed header re-prefilled every turn  -> trim toolsets (the real
+#    lever: measured 14.9K -> ~5K tokens) + bound context files; slot
+#    pinning + server cache flags keep the prefix warm.
 # 2. Auxiliary calls dying at 30s          -> single_flight gate + prefill-
 #    aware floors; deferrable features skip instead of queueing.
 # 3. Aux traffic evicting main cache       -> cache_key pinning + gate;
@@ -70,18 +71,23 @@ tool_output:
   max_lines: 300
   max_line_length: 2000
 
+# tool_search defers MCP/PLUGIN tools only — builtin toolset schemas are
+# never deferred (core tools by design). Header size is therefore governed
+# by the toolset list below, verified live: 5 toolsets ≈ 14.9K-token
+# header, the 3 below ≈ 5K. Add toolsets only when a workflow needs them.
 tools:
-  tool_search: { enabled: "on", threshold_pct: 2 }
+  tool_search: { enabled: "auto" }
 
-# Keep the injected tool schema small: every toolset costs header tokens on
-# EVERY turn. Start minimal; add toolsets when a workflow actually needs them.
 platform_toolsets:
   cli:
     - terminal
     - file
     - todo
-    - skills
-    - memory
+
+# Workspace context files (AGENTS.md etc.) inject into the header from the
+# agent's cwd — a 70KB AGENTS.md is ~8K tokens of header on every turn
+# (observed live). Bound it; run the agent from its real work directory.
+context_file_max_chars: 4000
 
 auxiliary:
   # Deferrable features skip when the server is busy (gate) — but on a

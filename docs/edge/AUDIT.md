@@ -61,6 +61,44 @@ Costs below are Lean-checked arithmetic on the profile shapes:
 | 25 (older desktop, 7-14B) | 69 s | ≈ 317 s | 16384 |
 | 10 (N100/SBC-class, 4-8B) | 171 s | 4,228 tok ≈ 423 s at budget 8192 — header size becomes the dominant term; shrink toolsets further / keep `tool_search` on | 8192 |
 
+## Live end-to-end run (real model, real server)
+
+Executed on an M1 Pro 32GB against llama-server (35B-A3B MoE Q4_K_M,
+Metal, measured prefill ~395 tok/s, decode ~31 tok/s), isolated
+`HERMES_HOME`, the edge profile, one 4-turn chat session driven over a PTY
+(passphrase set → recall → 20,000-line tool command → recall again):
+
+| Observed | Evidence |
+|---|---|
+| Header 14,866 tok with 5 toolsets + repo AGENTS.md → **~5K tok** after toolset trim + clean cwd | server log prompt_n; `hermes prompt-size` breakdown |
+| Turn 2 prefilled **+37 tokens in ~3 s** (vs 18 s full prefill on turn 1) | within-session prefix cache working end-to-end |
+| Tool flood capped: `seq 1 20000` (~100KB raw) entered history bounded; correct answer ("20000") | `tool_output.max_bytes` live |
+| Budget compaction fired at 6,500 tokens (13000 × 0.5), mechanical digest, **7→4 messages, −54%**, no LLM summary call, no livelock on the immediate ineffective retry | agent.log |
+| Passphrase recalled correctly **after 2 compactions** | digest keeps user turns verbatim |
+| Warmup ran post-compaction; **endpoint gate serialized it against the main call live** ("main waited 26.3s") | agent.log `local_runtime` lines |
+| Offline switches held: no update-check cache, no catalog cache created | isolated home stayed clean |
+
+Findings the run exposed (each now addressed or documented):
+
+1. **Preflight-compaction warmup raced the imminent real call** — the gate
+   made the collision safe (serialized, no cache damage) but the main call
+   waited 26 s for a warmup whose bytes then diverged (post-compaction
+   memory reload changes the system prompt). Fixed: warmup takes a 2 s
+   grace and yields (skip-when-busy) to an imminent real call; it now fires
+   usefully only in the idle post-response case.
+2. **`-z/--oneshot` ignores `--continue`/`--resume`** (upstream design:
+   every oneshot is a fresh session). Scripted multi-turn edge use needs
+   the chat/gateway process, or a future oneshot-resume feature.
+3. **Cross-session header reuse on hybrid-attention models depends on
+   checkpoint density** — with `--ctx-checkpoints 4` the new session's
+   header (a strict prefix of the old state) still fully re-prefilled.
+   Use the fork default 32 (scripts do); dense checkpoints are what make
+   restart-warm-starts real on SWA/hybrid models.
+4. Reasoning-heavy models grow context fast from their own thinking
+   (~4.9K generated tokens on the tool turn). On slow edge boxes consider
+   server-side reasoning off/low; the compaction budget contains it either
+   way.
+
 ## Honest limits (what this audit does NOT establish)
 
 1. **Lean proves the model, pytest pins the implementation, neither proves

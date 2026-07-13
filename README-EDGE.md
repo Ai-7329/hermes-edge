@@ -21,7 +21,7 @@ only — any byte change at the head forces a full re-prefill):
 
 | Observed failure | Root cause | Mechanism in this fork |
 |---|---|---|
-| 15,781-token fixed header → 5.3 min for "hello" | full header re-prefill on every cache miss | slot pinning via `custom_providers[].extra_body.cache_key` + trimmed toolsets + `tool_search`; server keeps checkpoints (`--ctx-checkpoints`) and parks evicted states (`--cache-ram`) |
+| 15,781-token fixed header → 5.3 min for "hello" | full header re-prefill on every cache miss | trimmed toolsets + bounded context files (measured live: 14.9K → ~5K tokens; `tool_search` defers MCP/plugin tools only) + slot pinning via `custom_providers[].extra_body.cache_key`; server keeps checkpoints (`--ctx-checkpoints`) and parks evicted states (`--cache-ram`) |
 | auxiliary calls all die at 30s ("cancel task") | static cloud deadlines + queueing behind main's multi-minute prefill with no concurrency control | single-flight endpoint gate (`local_runtime.single_flight`) — deferrable tasks **skip before sending HTTP**; prefill-aware timeout floors from `local_runtime.prefill_tps` |
 | aux interleaving wipes main's checkpoints → full re-prefill | requests race for the same server slot | the same gate (at most one in-flight request per local endpoint) + `cache_key` slot binding |
 | +16,419 tokens of tool output in one turn | `tool_output.max_bytes: 50000` ≈ 16.4K tokens — a cloud-sized cap | cap sized to prefill reality (6KB ≈ 35–40s); mechanical digest engine dedups on compaction |
