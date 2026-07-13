@@ -119,3 +119,24 @@ display:
 sessions:
   auto_prune: true           # long-running boxes: keep the session DB bounded
   retention_days: 90
+
+# ── Airgap / offline (factory edge boxes) ───────────────────────────────
+# Every switch below cuts an outbound network surface that would otherwise
+# fire (or wait out a connection timeout) on an offline box. Each is
+# consumed by real code, not aspirational: model_catalog gate at
+# hermes_cli/model_catalog.py get_catalog(), lsp gate at
+# agent/lsp/manager.py, tirith in the security config, startup update
+# check at hermes_cli/main.py (edge fork switch). The trimmed
+# platform_toolsets above already exclude web/browser/tts/vision tools;
+# install the CORE package only (pip install . — no extras) for a
+# ~200MB / 64-package venv.
+model_catalog:
+  enabled: false             # no manifest fetch; in-repo fallback data is used
+updates:
+  check_on_startup: false    # no git ls-remote / PyPI attempt at launch
+lsp:
+  enabled: false             # no on-demand language-server downloads
+security:
+  tirith_enabled: false      # no external scanner binary probing
+stt:
+  enabled: false             # no local whisper model load either (RAM)

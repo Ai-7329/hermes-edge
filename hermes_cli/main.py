@@ -774,6 +774,24 @@ def _sync_bundled_skills_for_startup() -> bool:
 
 
 def _termux_should_prefetch_update_check() -> bool:
+    # updates.check_on_startup: false — for airgapped/offline deployments
+    # (factory edge boxes). The check itself fail-softs without network, but
+    # it still attempts git ls-remote / PyPI on every launch and waits out
+    # connection timeouts on dead networks; an operator who knows the box is
+    # offline can turn the attempt off entirely.
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        raw = ((load_config_readonly() or {}).get("updates") or {}).get(
+            "check_on_startup", True,
+        )
+        if isinstance(raw, str):
+            if raw.strip().lower() in {"0", "false", "no", "off"}:
+                return False
+        elif not raw:
+            return False
+    except Exception:
+        pass
     if not _is_termux_startup_environment():
         return True
     return os.environ.get("HERMES_TERMUX_PREFETCH_UPDATES") == "1"
