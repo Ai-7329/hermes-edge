@@ -80,6 +80,10 @@ _DEFAULT_SKIP_WHEN_BUSY = (
     "curator",
     "profile_describer",
     "tts_audio_tags",
+    # Post-compaction cache warmup is pure opportunism: if the main
+    # conversation (or anything else) is already talking to the server,
+    # the warmup's job is being done by that request — skip, never queue.
+    "compression_warmup",
 )
 
 # Approximate bytes-per-token for mixed prose / code / JSON payloads.  Used
@@ -459,6 +463,19 @@ def local_aux_timeout_floor(base_url: str, messages: Optional[Iterable[Any]]) ->
     # Auxiliary responses are short (titles, digests, verdicts); a fixed
     # fraction of the decode budget is plenty.
     return floor + min(_decode_budget(), 120.0)
+
+
+def compression_warmup_enabled(base_url: str) -> bool:
+    """Whether post-compaction cache warmup may run for this endpoint.
+
+    Requires all three: the feature flag, an endpoint the gate governs, and
+    single-flight itself — the gate's skip-when-busy semantics are the only
+    thing keeping an opportunistic warmup from colliding with the user's
+    next message, so warmup without the gate is not offered.
+    """
+    if not bool(_read_cfg().get("compression_warmup", False)):
+        return False
+    return single_flight_enabled() and _is_governed_endpoint(base_url)
 
 
 def bounded_local_stale_seconds(base_url: str, est_tokens: int) -> Optional[float]:

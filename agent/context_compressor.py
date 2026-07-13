@@ -904,8 +904,14 @@ class ContextCompressor(ContextEngine):
         _configured_pct = getattr(
             self, "_configured_threshold_percent", self.threshold_percent,
         )
-        self.threshold_percent = self._effective_threshold_percent(
-            context_length, _configured_pct,
+        # An explicit compaction budget (compression.budget_tokens) states the
+        # operator's intended working-set size directly — the small-context
+        # raise exists to protect defaults from thrash, not to override a
+        # deliberate budget, so it is bypassed when a budget is active.
+        self.budget_tokens = self._configured_budget_tokens()
+        self.threshold_percent = (
+            _configured_pct if self.budget_tokens
+            else self._effective_threshold_percent(context_length, _configured_pct)
         )
         # max_tokens=None here means "caller didn't specify" → keep the existing
         # output reservation. A switch that genuinely changes the output budget
@@ -914,13 +920,14 @@ class ContextCompressor(ContextEngine):
             self.max_tokens = self._coerce_max_tokens(max_tokens)
         self.threshold_tokens = self._compute_threshold_tokens(
             context_length, self.threshold_percent, self.max_tokens,
+            budget_tokens=self.budget_tokens,
         )
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
-            int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
+            int(self._budget_window(context_length) * 0.05), _SUMMARY_TOKENS_CEILING,
         )
 
         # Reset cross-call calibration state captured under the PREVIOUS model.
@@ -987,8 +994,40 @@ class ContextCompressor(ContextEngine):
         return threshold_percent
 
     @staticmethod
+    def _configured_budget_tokens() -> int:
+        """Explicit compaction budget from ``compression.budget_tokens`` (0 = off).
+
+        On slow local backends the economics invert: compaction rewrites
+        history, and the next call re-prefills the whole rewritten prompt at
+        local prefill speed.  Riding a large window to its 50-85% trigger
+        makes each of those re-prefills cost tens of minutes.  The budget
+        lets an operator cap the working set ("treat the window as this many
+        tokens for compaction policy") so compaction fires early and each
+        planned re-prefill stays minutes-bounded, independent of the model's
+        real context_length (which stays truthful for everything else).
+        """
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            raw = ((load_config_readonly() or {}).get("compression") or {}).get(
+                "budget_tokens", 0,
+            )
+            value = int(raw)
+        except Exception:
+            return 0
+        return value if value > 0 else 0
+
+    def _budget_window(self, context_length: int) -> int:
+        """Window used for derived budgets: the smaller of window and budget."""
+        budget = getattr(self, "budget_tokens", 0) or 0
+        if budget > 0:
+            return max(1, min(int(context_length), budget))
+        return int(context_length)
+
+    @staticmethod
     def _compute_threshold_tokens(
         context_length: int, threshold_percent: float, max_tokens: int | None = None,
+        budget_tokens: int = 0,
     ) -> int:
         """Compute the compaction trigger threshold in tokens.
 
@@ -1017,6 +1056,14 @@ class ContextCompressor(ContextEngine):
         effective_window = context_length - (max_tokens or 0)
         if effective_window <= 0:
             effective_window = context_length
+        if budget_tokens and budget_tokens > 0:
+            # An explicit budget (compression.budget_tokens) is the operator's
+            # working-set statement: apply the configured percentage to it
+            # directly and skip the MINIMUM_CONTEXT_LENGTH floor — that floor
+            # protects defaults on large windows and would silently defeat a
+            # deliberate small budget.
+            budget_window = max(1, min(budget_tokens, effective_window))
+            return max(1, int(budget_window * threshold_percent))
         pct_value = int(effective_window * threshold_percent)
         floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
         # If flooring pushed the threshold to/over the effective window it can
@@ -1081,9 +1128,16 @@ class ContextCompressor(ContextEngine):
         # value is kept so update_model() can re-derive for a new window
         # (switching small -> large must drop back to the configured value).
         self._configured_threshold_percent = self.threshold_percent
-        self.threshold_percent = self._effective_threshold_percent(
-            self.context_length, self.threshold_percent,
-        )
+        # Explicit compaction budget bypasses the small-context raise — the
+        # raise protects defaults from thrash; a configured budget IS the
+        # operator's working-set intent. See _configured_budget_tokens().
+        self.budget_tokens = self._configured_budget_tokens()
+        if self.budget_tokens:
+            self.threshold_percent = self._configured_threshold_percent
+        else:
+            self.threshold_percent = self._effective_threshold_percent(
+                self.context_length, self.threshold_percent,
+            )
         threshold_percent = self.threshold_percent
         # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
         # the percentage would suggest a lower value.  This prevents premature
@@ -1093,6 +1147,7 @@ class ContextCompressor(ContextEngine):
         # window (small models), so auto-compression can still fire (#14690).
         self.threshold_tokens = self._compute_threshold_tokens(
             self.context_length, threshold_percent, self.max_tokens,
+            budget_tokens=self.budget_tokens,
         )
         self.compression_count = 0
 
@@ -1100,7 +1155,7 @@ class ContextCompressor(ContextEngine):
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
-            int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
+            int(self._budget_window(self.context_length) * 0.05), _SUMMARY_TOKENS_CEILING,
         )
 
         if not quiet_mode:

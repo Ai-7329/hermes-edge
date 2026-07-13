@@ -5623,11 +5623,126 @@ class AIAgent:
         ``force=False``.
         """
         from agent.conversation_compression import compress_context
-        return compress_context(
+        _pre_count = getattr(
+            getattr(self, "context_compressor", None), "compression_count", None,
+        )
+        result = compress_context(
             self, messages, system_message,
             approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
             force=force,
         )
+        # Post-compaction cache warmup (edge): compaction rewrites history, so
+        # the next call re-prefills the whole rewritten prompt — minutes at
+        # local prefill speeds. When the operator opted in, pay that prefill
+        # NOW, in idle time between turns, instead of at the start of the
+        # user's next message. Fire-and-forget; never affects the result.
+        try:
+            _post_count = getattr(
+                getattr(self, "context_compressor", None), "compression_count", None,
+            )
+            if (
+                isinstance(_pre_count, int)
+                and isinstance(_post_count, int)
+                and _post_count > _pre_count
+            ):
+                self._maybe_schedule_compression_warmup(result[0], result[1])
+        except Exception as _warm_err:
+            logger.debug("compression warmup scheduling skipped: %s", _warm_err)
+        return result
+
+    def _maybe_schedule_compression_warmup(self, messages: list, system_message: str) -> None:
+        """Prefill the post-compaction prompt into the local server's cache.
+
+        Sends a single-token request carrying the same system prompt, tools
+        and compressed history the next real call will send, so the server
+        rebuilds its prefix cache while the session is idle. Guarded by
+        ``local_runtime.compression_warmup`` and only offered under the
+        single-flight gate: the warmup runs with skip-when-busy semantics, so
+        any concurrent real request wins and the warmup silently steps aside.
+
+        Best-effort byte fidelity: the message scrub below mirrors the main
+        loop's per-message sanitation (conversation_loop's api_messages
+        assembly). If the prompts diverge the cost is one wasted idle-time
+        prefill, never a wrong conversation.
+        """
+        from agent.local_runtime import compression_warmup_enabled
+
+        if not compression_warmup_enabled(getattr(self, "base_url", "") or ""):
+            return
+        if self.api_mode in ("codex_responses", "anthropic_messages", "bedrock_converse"):
+            return
+        if getattr(self, "ephemeral_system_prompt", None) or getattr(self, "prefill_messages", None):
+            # These are injected at real-call time and would sit between the
+            # system prompt and history — a warmup without them prefixes
+            # differently and wastes the prefill. Skip.
+            return
+
+        def _warm() -> None:
+            from agent.chat_completion_helpers import build_api_kwargs
+            from agent.local_runtime import (
+                EndpointGate,
+                GateBusyError,
+                estimate_messages_tokens,
+                prefill_floor_seconds,
+                set_task_label,
+            )
+
+            set_task_label("compression_warmup")
+            client = None
+            try:
+                api_messages = []
+                for msg in messages:
+                    api_msg = dict(msg)
+                    api_msg.pop("reasoning", None)
+                    api_msg.pop("finish_reason", None)
+                    api_msg.pop("_thinking_prefill", None)
+                    if self._should_sanitize_tool_calls():
+                        self._sanitize_tool_calls_for_strict_api(api_msg, model=self.model)
+                    api_messages.append(api_msg)
+                if system_message:
+                    api_messages = [{"role": "system", "content": system_message}] + api_messages
+                api_messages = self._sanitize_api_messages(api_messages)
+                api_messages = self._drop_thinking_only_and_merge_users(
+                    api_messages,
+                    drop_codex_reasoning_items=self.api_mode != "codex_responses",
+                )
+                for am in api_messages:
+                    if isinstance(am.get("content"), str):
+                        am["content"] = am["content"].strip()
+
+                warm_kwargs = build_api_kwargs(self, api_messages)
+                for _mt_key in ("max_tokens", "max_completion_tokens"):
+                    if _mt_key in warm_kwargs:
+                        warm_kwargs[_mt_key] = 1
+                warm_kwargs.pop("stream", None)
+                warm_kwargs.pop("stream_options", None)
+                _floor = prefill_floor_seconds(estimate_messages_tokens(api_messages))
+                if _floor is not None:
+                    warm_kwargs["timeout"] = _floor + 60.0
+
+                with EndpointGate(self.base_url, purpose="compression_warmup"):
+                    client = self._create_request_openai_client(
+                        reason="compression_warmup", api_kwargs=warm_kwargs,
+                    )
+                    client.chat.completions.create(**warm_kwargs)
+                logger.info(
+                    "compression warmup: post-compaction prompt (%d messages) "
+                    "re-prefilled into local cache", len(api_messages),
+                )
+            except GateBusyError:
+                logger.debug("compression warmup: endpoint busy — skipped")
+            except Exception as warm_exc:
+                logger.debug("compression warmup failed (harmless): %s", warm_exc)
+            finally:
+                if client is not None:
+                    try:
+                        self._close_request_openai_client(client, reason="compression_warmup_done")
+                    except Exception:
+                        pass
+
+        threading.Thread(
+            target=_warm, name="hermes-compression-warmup", daemon=True,
+        ).start()
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""
