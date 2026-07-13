@@ -238,5 +238,11 @@ def approval_callback(cli, command: str, description: str) -> str:
         cli._approval_deadline = 0
         if hasattr(cli, "_app") and cli._app:
             cli._app.invalidate()
-        cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
-        return "deny"
+        # "deny_timeout", not "deny": nobody answered the prompt.  Reporting
+        # an unattended timeout as an explicit user denial sends the model
+        # chasing a refusal that never happened (and, on weaker models,
+        # into retry loops re-litigating the "denial").  Consumers in
+        # tools/approval.py phrase the two outcomes differently; both fail
+        # closed.
+        cprint(f"\n{_DIM}  ⏱ Timeout — denying command (unattended, not a user decision){_RST}")
+        return "deny_timeout"

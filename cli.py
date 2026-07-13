@@ -11743,8 +11743,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._approval_state = None
             self._approval_deadline = 0
             self._paint_now()
-            _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
-            return "deny"
+            # Unattended timeout is not a user decision — report it as
+            # "deny_timeout" so tools/approval.py phrases the BLOCKED message
+            # honestly instead of claiming the user refused (mirrors
+            # hermes_cli/callbacks.py).
+            _cprint(f"\n{_DIM}  ⏱ Timeout — denying command (unattended, not a user decision){_RST}")
+            return "deny_timeout"
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True) -> list[str]:
         """Return approval choices for a dangerous command prompt."""

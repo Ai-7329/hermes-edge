@@ -1660,6 +1660,27 @@ def save_permanent_allowlist(patterns: set):
 # Approval prompting + orchestration
 # =========================================================================
 
+def _timeout_denial_message() -> str:
+    """BLOCKED text for an approval prompt that expired unattended.
+
+    Deliberately distinct from the explicit-denial text: the user made NO
+    decision, so the model must neither treat it as a refusal nor keep
+    retrying (each retry would block the full timeout again and fail the
+    same way while the session is unattended).
+    """
+    timeout = _get_approval_timeout()
+    return (
+        f"BLOCKED: the approval prompt timed out after {timeout}s with no "
+        "response — the user was not at the terminal. This is NOT a user "
+        "decision: it is neither consent nor refusal. Do NOT retry this "
+        "command or rephrase it now; while the session is unattended every "
+        "retry will wait the full timeout and fail the same way. Continue "
+        "with work that does not require approval, and list this command in "
+        "your final response so the user can approve or run it when they "
+        "return."
+    )
+
+
 def prompt_dangerous_approval(command: str, description: str,
                               timeout_seconds: int | None = None,
                               allow_permanent: bool = True,
@@ -1674,7 +1695,10 @@ def prompt_dangerous_approval(command: str, description: str,
             prompt_toolkit integration. Signature:
             (command, description, *, allow_permanent=True) -> str.
 
-    Returns: 'once', 'session', 'always', or 'deny'
+    Returns: 'once', 'session', 'always', 'deny', or 'deny_timeout'
+    ('deny_timeout' = the prompt expired with nobody at the terminal —
+    fail closed like 'deny', but it is NOT a user decision and consumers
+    should phrase it as such).
     """
     if timeout_seconds is None:
         timeout_seconds = _get_approval_timeout()
@@ -1689,8 +1713,18 @@ def prompt_dangerous_approval(command: str, description: str,
 
     if approval_callback is not None:
         try:
-            return approval_callback(display_command, display_description,
-                                     allow_permanent=allow_permanent)
+            choice = approval_callback(display_command, display_description,
+                                       allow_permanent=allow_permanent)
+            # Fail closed on anything unrecognized: several call sites use
+            # "not deny → approve" fall-throughs, so an unexpected value
+            # from a callback must never read as consent.
+            if choice not in ("once", "session", "always", "deny", "deny_timeout"):
+                logger.warning(
+                    "Approval callback returned unrecognized value %r — "
+                    "treating as deny.", choice,
+                )
+                return "deny"
+            return choice
         except Exception as e:
             logger.error("Approval callback failed: %s", e, exc_info=True)
             return "deny"
@@ -2191,6 +2225,17 @@ def _run_approval_gate(
 
     choice = prompt_dangerous_approval(display_target, description,
                                        approval_callback=approval_callback)
+
+    # "deny_timeout" = the prompt expired unattended. Must be handled before
+    # the approve fall-through below: an unknown value here would read as
+    # consent, silently turning every timeout into an approval.
+    if choice == "deny_timeout":
+        return {
+            "approved": False,
+            "message": _timeout_denial_message(),
+            "pattern_key": pattern_key,
+            "description": description,
+        }
 
     if choice == "deny":
         return {
@@ -2918,6 +2963,15 @@ def check_all_command_guards(command: str, env_type: str,
         choice=choice,
     )
 
+    if choice == "deny_timeout":
+        return {
+            "approved": False,
+            "message": _timeout_denial_message(),
+            "pattern_key": primary_key,
+            "description": combined_desc,
+            "outcome": "timeout",
+            "user_consent": False,
+        }
     if choice == "deny":
         return {
             "approved": False,
