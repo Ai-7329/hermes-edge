@@ -8,6 +8,7 @@ from agent.title_generator import (
     auto_title_session,
     maybe_auto_title,
     _title_language,
+    _title_generation_enabled,
 )
 
 
@@ -335,3 +336,46 @@ class TestMaybeAutoTitle:
 
     def test_skips_if_no_session_db(self):
         maybe_auto_title(None, "sess-1", "hello", "response", [])  # no db
+
+
+class TestTitleGenerationEnabled:
+    """auxiliary.title_generation.enabled — full off switch (edge fork)."""
+
+    def _cfg(self, value):
+        return {"auxiliary": {"title_generation": {"enabled": value}}}
+
+    def test_default_is_enabled(self):
+        with patch("hermes_cli.config.load_config_readonly", return_value={}):
+            assert _title_generation_enabled() is True
+
+    def test_false_disables(self):
+        with patch(
+            "hermes_cli.config.load_config_readonly", return_value=self._cfg(False)
+        ):
+            assert _title_generation_enabled() is False
+
+    def test_string_off_disables(self):
+        with patch(
+            "hermes_cli.config.load_config_readonly", return_value=self._cfg("off")
+        ):
+            assert _title_generation_enabled() is False
+
+    def test_auto_title_session_short_circuits_when_disabled(self):
+        db = MagicMock()
+        with (
+            patch("agent.title_generator._title_generation_enabled", return_value=False),
+            patch("agent.title_generator.generate_title") as mock_gen,
+        ):
+            auto_title_session(db, "sess-1", "hello", "hi")
+        mock_gen.assert_not_called()
+        db.get_session_title.assert_not_called()
+        db.set_session_title.assert_not_called()
+
+    def test_maybe_auto_title_spawns_no_thread_when_disabled(self):
+        db = MagicMock()
+        with (
+            patch("agent.title_generator._title_generation_enabled", return_value=False),
+            patch("agent.title_generator.threading.Thread") as mock_thread,
+        ):
+            maybe_auto_title(db, "sess-1", "hello", "hi", [{"role": "user", "content": "hello"}])
+        mock_thread.assert_not_called()

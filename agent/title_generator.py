@@ -48,6 +48,28 @@ def _title_language() -> str:
         return ""
 
 
+def _title_generation_enabled() -> bool:
+    """Honor ``auxiliary.title_generation.enabled`` (default: on).
+
+    On slow local backends even this small call competes with the main
+    conversation for the server; operators can turn the feature off
+    entirely instead of just rerouting it.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        raw = (
+            ((load_config_readonly() or {}).get("auxiliary") or {})
+            .get("title_generation", {})
+            .get("enabled", True)
+        )
+    except Exception:
+        return True
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(raw)
+
+
 def generate_title(
     user_message: str,
     assistant_response: str,
@@ -137,6 +159,9 @@ def auto_title_session(
     if not session_db or not session_id:
         return
 
+    if not _title_generation_enabled():
+        return
+
     # Check if title already exists (user may have set one via /title before first response)
     try:
         existing = session_db.get_session_title(session_id)
@@ -180,6 +205,9 @@ def maybe_auto_title(
     - No title is already set
     """
     if not session_db or not session_id or not user_message or not assistant_response:
+        return
+
+    if not _title_generation_enabled():
         return
 
     # Count user messages in history to detect first exchange.
