@@ -57,7 +57,7 @@ Costs below are Lean-checked arithmetic on the profile shapes:
 
 | prefill tok/s | 6KB tool turn | re-prefill after compaction | recommended `budget_tokens` |
 |---|---|---|---|
-| 50 (i5-class, 35B-A3B MoE) | 34 s | 7,914 tok ≈ 158 s (hidden by warmup) | 32768 |
+| 50 (i5-class, 35B-A3B MoE — **measured, see below**) | 34 s | 7,914 tok ≈ 158 s (hidden by warmup) | 32768 |
 | 25 (older desktop, 7-14B) | 69 s | ≈ 317 s | 16384 |
 | 10 (N100/SBC-class, 4-8B) | 171 s | 4,228 tok ≈ 423 s at budget 8192 — header size becomes the dominant term; shrink toolsets further / keep `tool_search` on | 8192 |
 
@@ -101,6 +101,36 @@ Operational conclusions for an 8 GB deployment:
 Caveats: virtualized I/O and aarch64 NEON (a real x86 edge box with local
 NVMe differs in both directions); decode samples are short; multi-hour
 steady-state churn unmeasured.
+
+## Measured: the reference box (i5-14500 / 32 GB / 8 GB GPU)
+
+Phase-1 calibration from VERIFY.md, run on the deployment target
+(35B-A3B Q4_K_M, experts on CPU, `n_ctx` 66,560/slot × 2 slots — the
+`--parallel 2` split works on the hybrid-attention model):
+
+| Metric | Measured |
+|---|---|
+| Prefill, cold | 50–57 tok/s (stable: 19,491 tok / 389.7 s = 50.0; 17,446 / 343.6 s = 50.8) |
+| Prefill, checkpoint-restore mixed | 40–47 tok/s (restore works on-device) |
+| Decode, single slot | ~26 tok/s |
+| Decode, 2 slots concurrent | 12–13 tok/s each |
+| Decode vs context length | 22K → 17, 34K → 14, 37K → 13 tok/s |
+
+Three design assumptions this confirms:
+
+1. **Prefill ~50 tok/s is the world the fork was built for** — the
+   README's founding number, reproduced on the target.
+2. Decode ~26 sits at the computed memory-bandwidth ceiling
+   (dual-channel DDR5 ÷ ~2 GB active weights/token ≈ 27), and
+   **concurrency halves it** — which is why the endpoint gate serializes
+   instead of letting requests share the box.
+3. Decode decays with context (26 → 13 by 37K), so
+   `compression.budget_tokens` is not only re-prefill economics: keeping
+   the working set small **preserves generation speed** too.
+
+Profile calibration from these numbers: `local_runtime.prefill_tps: 40`
+(the checkpoint-restore-mixed floor, rounded down — deadlines derive
+from the slowest realistic prefill, not the cold best case).
 
 ## Measured: the cost of leaving half the machine free
 

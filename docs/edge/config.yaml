@@ -40,7 +40,10 @@ custom_providers:
 
 local_runtime:
   single_flight: true        # one in-flight request per local endpoint
-  prefill_tps: 50            # CHANGEME: measured prompt-processing tok/s
+  # Measured reference (i5-14500, 35B-A3B, experts on CPU): cold prefill
+  # 50-57 tok/s, checkpoint-restore-mixed 40-47. Set the FLOOR, not the
+  # best case — a too-high value makes deadlines too tight.
+  prefill_tps: 40            # CHANGEME: your measured floor (VERIFY.md Phase 1)
   decode_budget: 900         # max expected generation seconds per call
   timeout_margin: 30
   gate_wait_timeout: 900     # main conversation: max wait for the gate
@@ -59,6 +62,9 @@ compression:
   # Working-set cap: compaction triggers at budget_tokens x threshold
   # (16384 here), so every planned re-prefill stays ~2 min at 50 tok/s
   # instead of ~30 min when riding a 131K window to its default trigger.
+  # Measured bonus: decode decays with context (26 tok/s at small ctx ->
+  # 13 at 37K on the reference box) — a small working set preserves
+  # generation speed, not just re-prefill time.
   budget_tokens: 32768
 
 agent:
