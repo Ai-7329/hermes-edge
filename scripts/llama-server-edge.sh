@@ -49,6 +49,7 @@ exec nice -n "${NICE_LEVEL:-5}" "$LLAMA_SERVER" \
   --host 127.0.0.1 --port "$PORT" \
   --ctx-size 131072 \
   --parallel 2 \
+  `# hermes model.context_length must be ctx-size / parallel (per-slot)` \
   --ctx-checkpoints 32 \
   --cache-ram 4096 \
   --threads "$THREADS_DECODE" \

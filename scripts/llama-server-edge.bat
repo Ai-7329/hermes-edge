@@ -13,6 +13,9 @@ if "%MODEL_PATH%"==""   set MODEL_PATH=CHANGEME\model.gguf
 if "%ALIAS%"==""        set ALIAS=CHANGEME-model-alias
 if "%PORT%"==""         set PORT=8080
 
+rem NOTE: hermes model.context_length must be --ctx-size / --parallel
+rem (the PER-SLOT window): 131072 / 2 = 65536 with the defaults below.
+
 rem CPU split (example i5-14500, 6P+8E): decode on P-cores, prefill on all.
 if "%THREADS_DECODE%"==""  set THREADS_DECODE=6
 if "%THREADS_PREFILL%"=="" set THREADS_PREFILL=14

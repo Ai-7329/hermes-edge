@@ -14,7 +14,11 @@ model:
   provider: "custom"
   base_url: "http://127.0.0.1:8080/v1" # /v1 required
   api_key: "not-needed"                # match --api-key if you set one
-  context_length: 131072               # MUST equal the server's --ctx-size
+  # PER-SLOT window, not the server total: --ctx-size ÷ --parallel.
+  # The launch scripts default to --ctx-size 131072 --parallel 2 → 65536
+  # per slot. Getting this wrong by 2x delays compaction past the real
+  # window and risks provider 400s near the per-slot limit.
+  context_length: 65536
 
 # Pin the main conversation to one server slot so its prefix cache and
 # checkpoints survive other traffic. Requires a llama.cpp build that binds
