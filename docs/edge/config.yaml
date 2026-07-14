@@ -14,7 +14,13 @@ model:
   provider: "custom"
   base_url: "http://127.0.0.1:8080/v1" # /v1 required
   api_key: "not-needed"                # match --api-key if you set one
-  context_length: 131072               # MUST equal the server's --ctx-size
+  context_length: 131072               # MUST equal the server's PER-SLOT window.
+                                       # With --parallel 2 that is --ctx-size / 2,
+                                       # so the paired launch script uses
+                                       # --ctx-size 262144 (262144 / 2 = 131072).
+                                       # If the server slot is smaller than this,
+                                       # a grown conversation exceeds the slot and
+                                       # llama-server hard-rejects mid-session.
 
 # Pin the main conversation to one server slot so its prefix cache and
 # checkpoints survive other traffic. Requires a llama.cpp build that binds
@@ -29,8 +35,14 @@ custom_providers:
 # ── The four failure modes this profile closes ─────────────────────────
 #
 # 1. Fixed header re-prefilled every turn  -> trim toolsets (the real
-#    lever: measured 14.9K -> ~5K tokens) + bound context files; slot
-#    pinning + server cache flags keep the prefix warm.
+#    lever: measured 14.9K -> ~5K tokens; +session_search/+delegation add
+#    ~2 schemas, still far below the untrimmed header) + bound context files;
+#    slot pinning + server cache flags keep the prefix warm.
+#
+# Context strategy: bound RESIDENT tokens (prefill/decode cost), not accessible
+# information. mechanical engine (warm, non-lossy-ish) + session_search (cold,
+# retrievable) + delegation (horizontal) demote instead of delete, so the window
+# can stay wide (context_length 131072) without a blunt budget_tokens cap.
 # 2. Auxiliary calls dying at 30s          -> single_flight gate + prefill-
 #    aware floors; deferrable features skip instead of queueing.
 # 3. Aux traffic evicting main cache       -> cache_key pinning + gate;
@@ -56,10 +68,21 @@ compression:
   target_ratio: 0.20
   protect_first_n: 3
   protect_last_n: 20
-  # Working-set cap: compaction triggers at budget_tokens x threshold
-  # (16384 here), so every planned re-prefill stays ~2 min at 50 tok/s
-  # instead of ~30 min when riding a 131K window to its default trigger.
-  budget_tokens: 32768
+  # Working-set cap (OPTIONAL — left off by default now that the distributed
+  # tier above is enabled). budget_tokens caps the RESIDENT window: compaction
+  # fires at budget_tokens x threshold. Set low (e.g. 32768 -> 16K trigger) it
+  # bounds every re-prefill to ~2 min at 50 tok/s, but a 16K hot window head-cuts
+  # the model's own reasoning every few turns — you buy prefill speed with
+  # reasoning depth. That trade only stings when compaction is lossy; with
+  # context.engine mechanical (verbatim user turns + deduped tool index) AND
+  # session_search as a cold tier, a bounded window is "demoted, retrievable"
+  # rather than "deleted". Even so, prefer letting the window BREATHE:
+  #   - unset (recommended here): compaction rides to the default ~0.5 x 131072
+  #     (~65K) trigger. Worst-case re-prefill ~22 min, but that only happens when
+  #     the conversation genuinely fills the window; the cold tier absorbs the rest.
+  #   - middle ground: budget_tokens: 65536  -> ~32K hot window, re-prefill ~11 min.
+  # Uncomment ONLY if bounded re-prefill matters more than window depth:
+  # budget_tokens: 65536
 
 agent:
   max_turns: 150
@@ -83,6 +106,17 @@ platform_toolsets:
     - terminal
     - file
     - todo
+    # Distributed-context tier (demote, don't delete). These two add ~2 tool
+    # schemas to the header (small vs. a full toolset) and in return make the
+    # "bound resident tokens, not accessible information" design actually run:
+    - session_search   # COLD tier: recall compacted/past detail on demand via
+                       #   FTS5 session search — dropped turns stay retrievable
+                       #   instead of gone, so a bounded window costs less reasoning.
+                       #   NOTE: pull, not push — the model must choose to search.
+    - delegation       # HORIZONTAL spread: delegate_task spawns subagents with
+                       #   isolated windows, so one large task doesn't have to
+                       #   ride in a single window. single_flight serialises them
+                       #   on a one-box backend, but each subagent prefill stays bounded.
 
 # Workspace context files (AGENTS.md etc.) inject into the header from the
 # agent's cwd — a 70KB AGENTS.md is ~8K tokens of header on every turn

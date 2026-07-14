@@ -8,6 +8,16 @@
 # conversation's prefix cache.
 #
 # Flag provenance:
+#   --ctx-size 262144   with --parallel 2 => 131072 tokens PER SLOT, so the
+#                       per-conversation window matches the profile's
+#                       model.context_length (131072). --parallel 2 halves the
+#                       total across slots; size it as 2x the per-slot window
+#                       you promise Hermes, or a request can exceed the slot
+#                       and the server hard-rejects mid-session.
+#   -ctk q8_0 -ctv q8_0 q8 KV halves KV memory AND KV read bandwidth: it both
+#                       pays for the doubled --ctx-size (q8 KV @262144 ~= f16 KV
+#                       @131072 in VRAM) and flattens decode's long-context
+#                       slowdown. Needs --flash-attn on (set below).
 #   --ctx-checkpoints   upstream llama.cpp (PR 15293) — SWA/hybrid restore points
 #   --cache-ram         upstream llama.cpp (PR 16391) — parked states, checkpoint-inclusive
 #   cache_key binding   fork feature (e.g. llama-cpp-turboquant); harmless if absent
@@ -47,17 +57,18 @@ exec nice -n "${NICE_LEVEL:-5}" "$LLAMA_SERVER" \
   --model "$MODEL_PATH" \
   --alias "$ALIAS" \
   --host 127.0.0.1 --port "$PORT" \
-  --ctx-size 131072 \
+  --ctx-size 262144 \
   --parallel 2 \
   --ctx-checkpoints 32 \
   --cache-ram 4096 \
   --threads "$THREADS_DECODE" \
   --threads-batch "$THREADS_PREFILL" \
   --flash-attn on \
+  -ctk q8_0 -ctv q8_0 \
   "$@"
 
 # Model/GPU-specific flags to append via "$@" or here, per deployment:
 #   -ngl 99 --n-cpu-moe 999          # MoE: attention on GPU, experts on CPU
-#   -ctk q8_0 -ctv q8_0              # halve KV VRAM (needs flash-attn)
 #   --slot-save-path /path/to/slots  # optional: persist slots across restarts
 #   --ubatch-size 512                # prefill batch; tune against prefill tok/s
+# (KV quant -ctk/-ctv q8_0 is now enabled in the exec above, not optional.)

@@ -33,19 +33,26 @@ start "llama-server-edge" /BELOWNORMAL "%LLAMA_SERVER%" ^
   --model "%MODEL_PATH%" ^
   --alias "%ALIAS%" ^
   --host 127.0.0.1 --port %PORT% ^
-  --ctx-size 131072 ^
+  --ctx-size 262144 ^
   --parallel 2 ^
   --ctx-checkpoints 32 ^
   --cache-ram 4096 ^
   --threads %THREADS_DECODE% ^
   --threads-batch %THREADS_PREFILL% ^
   --flash-attn on ^
+  -ctk q8_0 -ctv q8_0 ^
   %*
+
+rem --ctx-size 262144 with --parallel 2 => 131072 PER SLOT, matching the
+rem profile's model.context_length (131072). Size ctx-size as 2x the per-slot
+rem window promised to Hermes, or a request can exceed one slot and the server
+rem hard-rejects mid-session. -ctk/-ctv q8_0 pays for the doubled window (q8 KV
+rem @262144 ~= f16 KV @131072 in VRAM) and flattens long-context decode.
 
 rem Model/GPU-specific flags to append via %* or here, per deployment:
 rem   -ngl 99 --n-cpu-moe 999          (MoE: attention on GPU, experts on CPU)
-rem   -ctk q8_0 -ctv q8_0              (halve KV VRAM; needs flash-attn)
 rem   --slot-save-path C:\hermes\slots (optional: persist slots across restarts)
 rem   --ubatch-size 512                (prefill batch; tune against prefill tok/s)
+rem (KV quant -ctk/-ctv q8_0 is now enabled above, not optional.)
 
 endlocal
