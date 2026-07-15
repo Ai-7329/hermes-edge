@@ -17,8 +17,17 @@ Tools:
   set_text(window, text, ref|name|automation_id)        -> set an edit value
   get_text(window, ref|name|automation_id)              -> read a value/name
   send_keys(keys)                        -> global keystrokes ("{Ctrl}s", "{Enter}")
+  set_clipboard(text) / get_clipboard()  -> clipboard (inject multi-line scripts)
+  paste_text(window, ref|name)           -> focus + Ctrl+V (load a script into a console)
   focus_window(window)                   -> bring a window to the foreground
   screenshot(path)                       -> best-effort PNG (fallback for UIA-opaque apps)
+
+Designed use case — driving an app whose Python API is GUI-only (e.g.
+TechnoStar Jupiter's PSJ console): the model generates a PSJ script, writes it
+to a file, set_clipboard() + paste_text() loads it into the script console,
+send_keys runs it, and the script writes results to a file the agent reads
+back. The heavy CAE logic stays in PSJ (Python); this server is only the
+courier + run button.
 
 Requires (Windows, Python 3.10+):
   pip install uiautomation "mcp[cli]"
@@ -361,6 +370,51 @@ def build_server():
         uiautomation SendKeys syntax."""
         try:
             auto.SendKeys(keys, waitTime=0)
+            return json.dumps({"ok": True})
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    @mcp.tool()
+    def set_clipboard(text: str) -> str:
+        """Put text on the Windows clipboard. The reliable way to inject a
+        multi-line script into a code editor / script console that
+        UIAutomation cannot type into (e.g. Jupiter's PSJ console): call this,
+        then paste_text() (or focus the console and send_keys("{Ctrl}v"))."""
+        try:
+            auto.SetClipboardText(text)
+            return json.dumps({"ok": True, "chars": len(text)})
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    @mcp.tool()
+    def get_clipboard() -> str:
+        """Read the current Windows clipboard text (e.g. output a console
+        copied to the clipboard)."""
+        try:
+            return json.dumps({"ok": True, "text": auto.GetClipboardText() or ""})
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    @mcp.tool()
+    def paste_text(
+        window: str = "",
+        ref: Optional[int] = None,
+        name: Optional[str] = None,
+        automation_id: Optional[str] = None,
+    ) -> str:
+        """Paste the clipboard via Ctrl+V. Optionally focus a target element
+        first (by ref/name/automation_id in `window`). This is the robust way
+        to load a multi-line PSJ script into Jupiter's script console even when
+        the editor widget is UIA-opaque: set_clipboard(script) then
+        paste_text(window, name='script console')."""
+        if ref is not None or name or automation_id:
+            try:
+                ctrl = _resolve(window, ref, name, automation_id, None)
+                ctrl.SetFocus()
+            except Exception as exc:
+                return json.dumps({"ok": False, "error": f"focus failed: {type(exc).__name__}: {exc}"})
+        try:
+            auto.SendKeys("{Ctrl}v", waitTime=0)
             return json.dumps({"ok": True})
         except Exception as exc:
             return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"})

@@ -65,8 +65,25 @@ approvals:
 | `set_text(window, text, ref\|name\|automation_id)` | set an edit field (Value pattern, atomic) |
 | `get_text(window, ref\|name\|automation_id)` | read a control's value/name |
 | `send_keys(keys)` | global keystrokes: `{Ctrl}s`, `{Enter}`, `{Alt}{F4}` |
+| `set_clipboard(text)` / `get_clipboard()` | clipboard I/O — inject a multi-line script / read copied output |
+| `paste_text(window, ref\|name)` | focus a target + Ctrl+V (load a script into a console) |
 | `focus_window(window)` | bring a window to the foreground |
 | `screenshot(path)` | best-effort PNG (fallback for UIA-opaque apps) |
+
+## Pattern: driving a GUI-only Python API (e.g. Jupiter PSJ)
+
+When an app's scripting (PSJ = Python Scripting for Jupiter) runs **only** from
+its in-GUI console, use this server as a *script courier*, not to click through
+the work (the 3D viewport is UIA-opaque and un-clickable anyway):
+
+1. Model generates a PSJ script for the task (mesh / BC / result extraction)
+   that **writes its results to a file** (CSV/JSON).
+2. `set_clipboard(script)` → `focus_window("Jupiter")` → open the script
+   console → `paste_text(...)` → `send_keys("{Enter}")` or click **Run**.
+3. Agent reads the results file with its normal file tools → builds the report.
+
+The CAE logic stays in Python (PSJ); the UI layer only delivers and runs it.
+Map your Jupiter's exact "load/run script" menu path once with `dump_tree`.
 
 Typical loop the model runs: `list_windows` → `dump_tree` → act by `ref` →
 `dump_tree` again to confirm.
