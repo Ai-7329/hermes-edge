@@ -161,6 +161,37 @@ Findings the run exposed (each now addressed or documented):
    server-side reasoning off/low; the compaction budget contains it either
    way.
 
+## Long-run stability (`docs/edge/audit/EdgeStability.lean`)
+
+`EdgeAudit.lean` certifies single-turn arithmetic; it says nothing about a
+session's behavior over hours. A live long-running run exposed the gap: the
+resident window rode to **93,551 tokens**, decode collapsed to **7.57 tok/s**,
+and slot switching under `--parallel 2` forced **full re-prefills of the
+entire window** (`forcing full prompt re-processing due to lack of cache
+data` — hybrid/SWA checkpoint invalidation), each ≈ **29 min at 54 tok/s**,
+*per turn*. Slots were always chosen `by LRU`/`by LCP`, never `by cache_key`
+— the pin was never honored.
+
+`EdgeStability.lean` models the session as a discrete dynamical system and
+proves per-turn prefill cost is bounded by a **constant independent of
+session length** iff three requirements hold together:
+
+| # | Requirement | Lean theorem(s) | pytest | Anchored to |
+|---|---|---|---|---|
+| R1 | Exclusive slot tenancy (`--parallel 1`, no aux on the endpoint) | `exclusive_tenancy_hits`, `interleaving_forces_miss`, `two_slots_thrash` | `test_R1_*` | LRU thrash → 93,551-tok miss |
+| R2 | Bounded resident window (`compression.budget_tokens`) | `per_turn_cost_le_budget`, `EdgeAudit.trigger_le_budget` | `test_R2_bounded_window` | 32768 → worst miss ~10 min |
+| R3 | Archive present, so R2 relocates not deletes | `archive_preserves_accessible`, `delete_loses_information` | `test_R3_archive_enabled` | session_search + mechanical |
+| — | Miss cost model, anchored to the live run | `miss_cost_full`, `miss_cost_mono` | `TestStabilityModel` | `prefillMs 93551 54 = 1732425` |
+
+The design consequence — reversing the earlier "let the window breathe,
+`--parallel 2`" tuning — is machine-checked: `two_slots_thrash` shows two
+slots do not save you once a third context (aux/subagent) appears, so the
+sound configuration is one slot serving only the main conversation, a
+bounded working set, and the cold tier that makes bounding lossless. R3 is
+the formal form of the operator's own objection ("a bare cap costs
+reasoning"): `delete_loses_information` proves it for the no-archive case,
+`archive_preserves_accessible` proves it vanishes once session_search exists.
+
 ## Honest limits (what this audit does NOT establish)
 
 1. **Lean proves the model, pytest pins the implementation, neither proves
@@ -168,8 +199,12 @@ Findings the run exposed (each now addressed or documented):
    empirical (covered by tests, not proofs).
 2. **Async auxiliary paths are not gated** (MoA/gateway aggregation — not
    loaded in the edge CLI profile, but a known boundary).
-3. **Multi-day soak is not yet run.** Session pruning and log rotation are
-   configured; RSS drift over weeks needs an on-device measurement.
+3. **Multi-day soak is not yet run.** The *cost dynamics* over a long
+   session are now modelled and proven bounded (`EdgeStability.lean`, R1-R3
+   above), and the failure of the un-bounded/multi-slot configuration is
+   anchored to a live run. What remains empirical is RSS drift over weeks
+   and the on-device wall-clock under R1-R3 — session pruning and log
+   rotation are configured, but a real multi-day soak is still needed.
 4. **Process floor is ~100 MB-class Python.** Fine for 4 GB+ boxes next to
    a small model; genuinely MCU-class (<1 GB) targets are out of scope for
    this codebase.

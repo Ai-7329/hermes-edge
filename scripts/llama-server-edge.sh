@@ -1,26 +1,37 @@
 #!/usr/bin/env bash
 # llama-server launch template for hermes-edge (Unix/macOS).
 #
-# Carries the server half of the edge contract (docs/edge/config.yaml):
-# the agent pins its conversation to a slot via request cache_key; the
-# server keeps per-slot context checkpoints and parks evicted states in
-# host RAM so auxiliary traffic can never silently destroy the main
-# conversation's prefix cache.
+# Carries the server half of the edge contract (docs/edge/config.yaml).
+#
+# STABILITY REQUIREMENT R1 — EXCLUSIVE SLOT TENANCY (proven in
+# docs/edge/audit/EdgeStability.lean). On hybrid/SWA attention a conversation
+# that shares its slot with ANY other traffic can be evicted and forced into a
+# full re-prefill of its ENTIRE resident window (measured: 93,551 tokens ≈ 29
+# min at 54 tok/s, per turn). `two_slots_thrash` shows --parallel 2 does not
+# save you once a third context (aux / subagent) appears, and the live logs
+# never once bound a slot `by cache_key` (only `by LRU` / `by LCP`) — so
+# correctness must NOT depend on the pin. The sound configuration is therefore
+# ONE slot serving ONLY the main conversation: --parallel 1, and every
+# auxiliary LLM call disabled or pointed at a SEPARATE endpoint (the profile's
+# mechanical context engine already issues no compaction call at all).
 #
 # Flag provenance:
-#   --ctx-size 262144   with --parallel 2 => 131072 tokens PER SLOT, so the
-#                       per-conversation window matches the profile's
-#                       model.context_length (131072). --parallel 2 halves the
-#                       total across slots; size it as 2x the per-slot window
-#                       you promise Hermes, or a request can exceed the slot
-#                       and the server hard-rejects mid-session.
-#   -ctk q8_0 -ctv q8_0 q8 KV halves KV memory AND KV read bandwidth: it both
-#                       pays for the doubled --ctx-size (q8 KV @262144 ~= f16 KV
-#                       @131072 in VRAM) and flattens decode's long-context
-#                       slowdown. Needs --flash-attn on (set below).
+#   --parallel 1        exclusive tenancy (R1): one slot, one conversation, so
+#                       its checkpoint is never evicted by other traffic. With
+#                       one slot the per-conversation window IS --ctx-size.
+#   --ctx-size 131072   equals the per-slot window, matched to the profile's
+#                       model.context_length (131072). A grown conversation that
+#                       exceeded the slot would hard-reject mid-session, so the
+#                       working set is bounded below this by compression
+#                       (R2: compression.budget_tokens).
+#   -ctk q8_0 -ctv q8_0 q8 KV halves KV memory AND KV read bandwidth: frees VRAM
+#                       and flattens decode's long-context slowdown. Needs
+#                       --flash-attn on (set below).
 #   --ctx-checkpoints   upstream llama.cpp (PR 15293) — SWA/hybrid restore points
-#   --cache-ram         upstream llama.cpp (PR 16391) — parked states, checkpoint-inclusive
-#   cache_key binding   fork feature (e.g. llama-cpp-turboquant); harmless if absent
+#   --cache-ram         upstream llama.cpp (PR 16391) — parked states; size it to
+#                       hold the one conversation's full bounded state (log prints MiB)
+#   cache_key binding   fork feature; now belt-and-suspenders only — R1 holds by
+#                       topology (single slot), not by the pin being honored.
 #
 # Everything marked CHANGEME is deployment-specific. Measure, don't guess:
 #   prefill tok/s  -> feed into local_runtime.prefill_tps in the profile
@@ -57,8 +68,8 @@ exec nice -n "${NICE_LEVEL:-5}" "$LLAMA_SERVER" \
   --model "$MODEL_PATH" \
   --alias "$ALIAS" \
   --host 127.0.0.1 --port "$PORT" \
-  --ctx-size 262144 \
-  --parallel 2 \
+  --ctx-size 131072 \
+  --parallel 1 \
   --ctx-checkpoints 32 \
   --cache-ram 4096 \
   --threads "$THREADS_DECODE" \

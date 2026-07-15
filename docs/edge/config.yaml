@@ -15,17 +15,20 @@ model:
   base_url: "http://127.0.0.1:8080/v1" # /v1 required
   api_key: "not-needed"                # match --api-key if you set one
   context_length: 131072               # MUST equal the server's PER-SLOT window.
-                                       # With --parallel 2 that is --ctx-size / 2,
-                                       # so the paired launch script uses
-                                       # --ctx-size 262144 (262144 / 2 = 131072).
-                                       # If the server slot is smaller than this,
-                                       # a grown conversation exceeds the slot and
-                                       # llama-server hard-rejects mid-session.
+                                       # Under the stability design (R1) the
+                                       # server runs --parallel 1, so the per-slot
+                                       # window IS --ctx-size: the launch script
+                                       # uses --ctx-size 131072. The working set
+                                       # is bounded well below this by compression
+                                       # (R2), so this is headroom for reasoning
+                                       # bursts, not the steady-state size.
 
-# Pin the main conversation to one server slot so its prefix cache and
-# checkpoints survive other traffic. Requires a llama.cpp build that binds
-# slots by request cache_key (e.g. llama-cpp-turboquant; upstream builds
-# without it simply ignore the field).
+# cache_key requests slot binding on builds that honor it (llama-cpp-turboquant;
+# others ignore it). It is now BELT-AND-SUSPENDERS only: stability requirement R1
+# holds by TOPOLOGY — the launch script runs --parallel 1, so the main
+# conversation owns the only slot and cannot be evicted regardless of whether the
+# pin is honored. The observed build never bound a slot `by cache_key` (only
+# `by LRU`/`by LCP`), which is exactly why correctness must not depend on it.
 custom_providers:
   - name: "local-llama"
     base_url: "http://127.0.0.1:8080/v1"
@@ -39,16 +42,24 @@ custom_providers:
 #    ~2 schemas, still far below the untrimmed header) + bound context files;
 #    slot pinning + server cache flags keep the prefix warm.
 #
-# Context strategy: bound RESIDENT tokens (prefill/decode cost), not accessible
-# information. mechanical engine (warm, non-lossy-ish) + session_search (cold,
-# retrievable) + delegation (horizontal) demote instead of delete, so the window
-# can stay wide (context_length 131072) without a blunt budget_tokens cap.
 # 2. Auxiliary calls dying at 30s          -> single_flight gate + prefill-
 #    aware floors; deferrable features skip instead of queueing.
-# 3. Aux traffic evicting main cache       -> cache_key pinning + gate;
-#    optionally point auxiliary.* at a second small-model server.
+# 3. Aux traffic evicting main cache       -> EXCLUSIVE TENANCY (R1): --parallel 1
+#    so nothing shares the main slot; keep every aux LLM call off this endpoint
+#    (mechanical engine issues none) or on a separate server (auxiliary.* below).
 # 4. Tool output flooding history          -> tool_output caps (a 50KB cap
 #    is ~16K tokens = ~5 min of prefill at 50 tok/s; 6KB is ~35s).
+#
+# ── Long-run stability (docs/edge/audit/EdgeStability.lean) ─────────────
+# Per-turn prefill cost is bounded by a CONSTANT (not the growing context) iff
+# three requirements hold together — proven, not tuned:
+#   R1 exclusive tenancy  -> --parallel 1 + no aux on the main endpoint
+#                            (two_slots_thrash: --parallel 2 alone is unstable)
+#   R2 bounded window     -> compression.budget_tokens set (per_turn_cost_le_budget)
+#   R3 archive present    -> session_search + mechanical engine, so R2 relocates
+#                            information instead of deleting it (archive_preserves_accessible)
+# Drop any one and the design degrades to the observed failure: a 93K window,
+# ~29-min re-prefills on eviction, 7.57 tok/s decode.
 
 local_runtime:
   single_flight: true        # one in-flight request per local endpoint
@@ -68,21 +79,23 @@ compression:
   target_ratio: 0.20
   protect_first_n: 3
   protect_last_n: 20
-  # Working-set cap (OPTIONAL — left off by default now that the distributed
-  # tier above is enabled). budget_tokens caps the RESIDENT window: compaction
-  # fires at budget_tokens x threshold. Set low (e.g. 32768 -> 16K trigger) it
-  # bounds every re-prefill to ~2 min at 50 tok/s, but a 16K hot window head-cuts
-  # the model's own reasoning every few turns — you buy prefill speed with
-  # reasoning depth. That trade only stings when compaction is lossy; with
-  # context.engine mechanical (verbatim user turns + deduped tool index) AND
-  # session_search as a cold tier, a bounded window is "demoted, retrievable"
-  # rather than "deleted". Even so, prefer letting the window BREATHE:
-  #   - unset (recommended here): compaction rides to the default ~0.5 x 131072
-  #     (~65K) trigger. Worst-case re-prefill ~22 min, but that only happens when
-  #     the conversation genuinely fills the window; the cold tier absorbs the rest.
-  #   - middle ground: budget_tokens: 65536  -> ~32K hot window, re-prefill ~11 min.
-  # Uncomment ONLY if bounded re-prefill matters more than window depth:
-  # budget_tokens: 65536
+  # STABILITY REQUIREMENT R2 — BOUNDED WINDOW (docs/edge/audit/EdgeStability.lean,
+  # per_turn_cost_le_budget). budget_tokens caps the RESIDENT window: compaction
+  # fires at budget_tokens x threshold, so the worst-case re-prefill is a CONSTANT
+  # independent of session length. Without it the window rides to the provider
+  # limit and every checkpoint miss is O(context) — the observed 93,551-token /
+  # ~29-min re-prefill and 7.57 tok/s decode. 32768 -> 16,384-token trigger,
+  # worst miss ~5.5 min at 50 tok/s; and because R1 (exclusive tenancy) keeps
+  # checkpoints alive, warm turns re-prefill only the delta, not this bound.
+  #
+  # This is NOT the "cap reasoning" trade rejected earlier: that objection holds
+  # only when compaction DELETES (delete_loses_information). Here R3 makes it a
+  # relocation — mechanical engine keeps user turns + tool index verbatim in the
+  # window, and session_search keeps the rest retrievable, so accessible
+  # information is invariant under compaction (archive_preserves_accessible).
+  # Raise toward 65536 (~11-min worst miss) only if you want a wider working set
+  # and can absorb the longer cold/miss prefill.
+  budget_tokens: 32768
 
 agent:
   max_turns: 150

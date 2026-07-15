@@ -33,8 +33,8 @@ start "llama-server-edge" /BELOWNORMAL "%LLAMA_SERVER%" ^
   --model "%MODEL_PATH%" ^
   --alias "%ALIAS%" ^
   --host 127.0.0.1 --port %PORT% ^
-  --ctx-size 262144 ^
-  --parallel 2 ^
+  --ctx-size 131072 ^
+  --parallel 1 ^
   --ctx-checkpoints 32 ^
   --cache-ram 4096 ^
   --threads %THREADS_DECODE% ^
@@ -43,11 +43,15 @@ start "llama-server-edge" /BELOWNORMAL "%LLAMA_SERVER%" ^
   -ctk q8_0 -ctv q8_0 ^
   %*
 
-rem --ctx-size 262144 with --parallel 2 => 131072 PER SLOT, matching the
-rem profile's model.context_length (131072). Size ctx-size as 2x the per-slot
-rem window promised to Hermes, or a request can exceed one slot and the server
-rem hard-rejects mid-session. -ctk/-ctv q8_0 pays for the doubled window (q8 KV
-rem @262144 ~= f16 KV @131072 in VRAM) and flattens long-context decode.
+rem STABILITY REQUIREMENT R1 (docs/edge/audit/EdgeStability.lean): --parallel 1
+rem gives the main conversation EXCLUSIVE tenancy of the one slot, so its
+rem checkpoint is never evicted by aux/subagent traffic and forced into a full
+rem re-prefill (observed: 93,551 tokens ~= 29 min at 54 tok/s, per turn). Two
+rem slots without a honored cache_key pin thrash (two_slots_thrash); the live
+rem logs never bound a slot by cache_key. With one slot the per-conversation
+rem window IS --ctx-size (131072), matched to model.context_length; the working
+rem set is bounded well below it by compression.budget_tokens (R2). Keep all
+rem auxiliary LLM calls off this endpoint (mechanical engine already makes none).
 
 rem Model/GPU-specific flags to append via %* or here, per deployment:
 rem   -ngl 99 --n-cpu-moe 999          (MoE: attention on GPU, experts on CPU)

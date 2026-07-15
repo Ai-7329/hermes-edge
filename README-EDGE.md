@@ -23,7 +23,8 @@ only — any byte change at the head forces a full re-prefill):
 |---|---|---|
 | 15,781-token fixed header → 5.3 min for "hello" | full header re-prefill on every cache miss | trimmed toolsets + bounded context files (measured live: 14.9K → ~5K tokens; `tool_search` defers MCP/plugin tools only) + slot pinning via `custom_providers[].extra_body.cache_key`; server keeps checkpoints (`--ctx-checkpoints`) and parks evicted states (`--cache-ram`) |
 | auxiliary calls all die at 30s ("cancel task") | static cloud deadlines + queueing behind main's multi-minute prefill with no concurrency control | single-flight endpoint gate (`local_runtime.single_flight`) — deferrable tasks **skip before sending HTTP**; prefill-aware timeout floors from `local_runtime.prefill_tps` |
-| aux interleaving wipes main's checkpoints → full re-prefill | requests race for the same server slot | the same gate (at most one in-flight request per local endpoint) + `cache_key` slot binding |
+| aux interleaving wipes main's checkpoints → full re-prefill | requests race for the same server slot | single-flight gate + **exclusive slot tenancy** (`--parallel 1`, aux off the endpoint) — proven stability requirement R1, not a best-effort `cache_key` pin |
+| long-run: window rode to **93,551 tok**, decode 7.57 tok/s, slot switch forced **~29-min full re-prefills per turn** (measured live) | unbounded working set + LRU multi-slot on hybrid/SWA attention (`cache_key` never honored — slots picked `by LRU`/`by LCP`) | **formally-derived fix** (`docs/edge/audit/EdgeStability.lean`): R1 exclusive tenancy + R2 `budget_tokens` bounded window + R3 `session_search` archive ⇒ per-turn cost bounded by a constant independent of session length |
 | +16,419 tokens of tool output in one turn | `tool_output.max_bytes: 50000` ≈ 16.4K tokens — a cloud-sized cap | cap sized to prefill reality (6KB ≈ 35–40s); mechanical digest engine dedups on compaction |
 | compaction livelock (66 attempts / 0 successes, 9h54m) | LLM summarizer needs a full-window prefill at the exact moment the context is fullest | **mechanical context engine** — deterministic extraction, no LLM call, no timeout (`context.engine: mechanical`) |
 | unattended approval timeout reported as "User denied" | mislabel caused models to retry the same command against nobody | honest `deny_timeout` reporting |
@@ -84,6 +85,13 @@ hanging forever.
 3. **Fail open, never wedge.** Exclusivity, warmup, floors — every mechanism
    degrades to upstream behavior on error, timeout, or missing config.
 4. **Cloud paths untouched.** Every hook no-ops for non-local endpoints.
+5. **Correctness by topology, not by a server feature we can't verify.**
+   Long-run stability requires exclusive slot tenancy (R1); we get it from
+   `--parallel 1`, not from a `cache_key` pin the build may silently ignore.
+   The three requirements — exclusive tenancy, bounded window, present
+   archive — are machine-checked to bound per-turn cost by a constant
+   (`docs/edge/audit/EdgeStability.lean`); dropping any one reproduces the
+   observed 93K-window / ~29-min-re-prefill / 7.57-tok/s failure.
 
 ## Known limits / deferred
 
@@ -107,6 +115,16 @@ the design arithmetic and gate decision table are machine-checked in Lean 4
 each theorem is pinned to the implementation by a named pytest, and the
 footprint/offline claims are measured (import RSS 93 MB, core install
 64 packages / 195 MB, zero unconditional outbound on CLI launch).
+
+**Long-run stability** is a second machine-checked model,
+`docs/edge/audit/EdgeStability.lean` (`lean EdgeStability.lean` exits 0),
+pinned by `tests/edge/test_edge_stability.py`. It treats a session as a
+discrete dynamical system and proves per-turn prefill cost stays bounded by a
+constant — independent of how long the session runs — iff three requirements
+hold: **R1** exclusive slot tenancy (`--parallel 1`), **R2** a bounded working
+set (`compression.budget_tokens`), and **R3** a present archive
+(`session_search`) so bounding relocates rather than deletes information. The
+test also fails if the shipped profile/launch scripts drift off R1–R3.
 
 ## Relationship to upstream
 
