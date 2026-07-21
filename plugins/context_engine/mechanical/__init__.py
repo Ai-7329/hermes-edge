@@ -108,6 +108,14 @@ _ELIDE_RE = re.compile(r"^- … (\d+) earlier item\(s\) elided")
 # position, and must never be parsed back as content on self-merge.
 _NONE_PLACEHOLDER = "- (none in this window)"
 _NO_POSITION_PLACEHOLDER = "(no substantive assistant report in this window)"
+_HARD_CUT_MARKER = "… [digest hard-cut to budget]"
+
+
+def _elision_marker(count: int) -> str:
+    """The one marker format _ELIDE_RE recognises — every path that drops
+    items must emit exactly this, or counts stop carrying across merges."""
+    return (f"- … {count} earlier item(s) elided "
+            f"(raw remains in the session DB) …")
 
 
 def _single_line(text: str, limit: int) -> str:
@@ -259,10 +267,17 @@ class MechanicalDigestEngine(ContextCompressor):
         cannot re-enter through this path.
         """
         try:
-            body = self._build_digest(turns_to_summarize, focus_topic)
+            body = redact_sensitive_text(
+                self._build_digest(turns_to_summarize, focus_topic)
+            )
+            self._previous_summary = body
         except Exception:
             # A mechanical engine must not resurrect the failure path: fall
-            # back to a counting stub rather than returning None.
+            # back to a counting stub rather than returning None.  Do NOT
+            # overwrite _previous_summary with the stub — it carries the
+            # accumulated lineage (contracts, tool index), and one transient
+            # builder error must not destroy it; the next compaction merges
+            # from the kept lineage as usual.
             logger.exception("mechanical digest failed — emitting counting stub")
             body = (
                 f"{_GEN_MARKER}\n"
@@ -270,8 +285,6 @@ class MechanicalDigestEngine(ContextCompressor):
                 f"{len(turns_to_summarize)} turn(s) compacted; raw turns remain "
                 f"in the session DB."
             )
-        body = redact_sensitive_text(body)
-        self._previous_summary = body
         return self._with_summary_prefix(body)
 
     # -- Budget-proportional shape -------------------------------------------
@@ -401,19 +414,35 @@ class MechanicalDigestEngine(ContextCompressor):
             elif current and stripped.startswith("- "):
                 if stripped != _NONE_PLACEHOLDER:
                     sections[current].append(stripped)
-            elif current == _SEC_LEGACY and stripped:
+            elif current == _SEC_LEGACY and stripped and stripped != _HARD_CUT_MARKER:
+                # The hard-cut marker is a rendering artifact; ingesting it as
+                # legacy content would replay it as text on every re-merge.
                 sections[current].append(stripped)
         return sections
 
     @staticmethod
     def _merge_tool_lines(prev: List[str], new: List[str]) -> List[str]:
-        """Dedup by the '- <tool> `<arg>` →' identity prefix, newest wins."""
+        """Dedup by the '- <tool> `<arg>` →' identity prefix, newest wins.
+
+        Elision-marker counts from the previous digest are carried forward,
+        not dropped — the tool index must account for every run it has ever
+        elided, same as the user/spine sections.
+        """
         def ident(line: str) -> str:
             return line.split("→", 1)[0].strip()
         new_idents = {ident(l) for l in new}
-        kept = [l for l in prev if ident(l) not in new_idents
-                and not _ELIDE_RE.match(l)]
-        return kept + new
+        carried = 0
+        kept = []
+        for l in prev:
+            m = _ELIDE_RE.match(l)
+            if m:
+                carried += int(m.group(1))
+            elif ident(l) not in new_idents:
+                kept.append(l)
+        merged = kept + new
+        if carried:
+            merged.insert(0, _elision_marker(carried))
+        return merged
 
     @staticmethod
     def _elide(
@@ -441,10 +470,7 @@ class MechanicalDigestEngine(ContextCompressor):
         items = kept_items
         if len(items) <= cap:
             if carried:
-                items = [
-                    f"- … {carried} earlier item(s) elided "
-                    f"(raw remains in the session DB) …"
-                ] + items
+                items = [_elision_marker(carried)] + items
             return items
         topic = (focus_topic or "").casefold()
         pinned = [l for l in items if topic and topic in l.casefold()]
@@ -462,11 +488,7 @@ class MechanicalDigestEngine(ContextCompressor):
         merged = head + [l for l in pinned if l not in head and l not in kept_tail] + kept_tail
         n_dropped = len(items) - len(merged) + carried
         if n_dropped > 0:
-            marker = (
-                f"- … {n_dropped} earlier item(s) elided "
-                f"(raw remains in the session DB) …"
-            )
-            merged.insert(len(head), marker)
+            merged.insert(len(head), _elision_marker(n_dropped))
         return merged
 
     # -- Char-budget fitting --------------------------------------------------
@@ -525,11 +547,7 @@ class MechanicalDigestEngine(ContextCompressor):
             real.pop(victim)
             dropped += 1
         if dropped:
-            real.insert(
-                min(head_keep, len(real)),
-                f"- … {dropped} earlier item(s) elided "
-                f"(raw remains in the session DB) …",
-            )
+            real.insert(min(head_keep, len(real)), _elision_marker(dropped))
         return real
 
     # -- Rendering -----------------------------------------------------------
@@ -662,7 +680,7 @@ class MechanicalDigestEngine(ContextCompressor):
             )
             cut = body[:budget]
             cut = cut[: cut.rfind("\n")] if "\n" in cut else cut
-            body = cut.rstrip() + "\n… [digest hard-cut to budget]"
+            body = cut.rstrip() + "\n" + _HARD_CUT_MARKER
         return body
 
 

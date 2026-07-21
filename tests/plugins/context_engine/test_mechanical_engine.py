@@ -250,6 +250,58 @@ def test_small_budget_self_merge_keeps_newest_and_marks_elision(engine):
     assert "タスク0:" in user_sec
 
 
+def test_builder_error_stub_preserves_lineage(engine, monkeypatch):
+    """A transient digest-builder error must emit the counting stub WITHOUT
+    overwriting _previous_summary — one bad window must not destroy the
+    accumulated lineage (contracts, tool index) of every prior compaction."""
+    good = engine._generate_summary(
+        [{"role": "user", "content": "契約: リリース前に必ずテストを回す"}]
+    )
+    assert "契約: リリース前に必ずテストを回す" in good
+    lineage_before = engine._previous_summary
+    monkeypatch.setattr(engine, "_build_digest",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    stub = engine._generate_summary([{"role": "user", "content": "lost window"}])
+    assert "digest builder error" in stub
+    assert engine._previous_summary == lineage_before, \
+        "stub overwrote the accumulated digest lineage"
+    monkeypatch.undo()
+    nxt = engine._generate_summary([{"role": "user", "content": "next window"}])
+    assert "契約: リリース前に必ずテストを回す" in nxt, \
+        "lineage did not survive across the stub compaction"
+
+
+def test_merge_tool_lines_carries_elision_counts():
+    """The tool index must account for every run it has ever elided — the
+    old merge silently dropped the previous digest's marker counts."""
+    from plugins.context_engine.mechanical import (
+        MechanicalDigestEngine, _elision_marker,
+    )
+    prev = [_elision_marker(7),
+            "- terminal `old cmd` → exit 0",
+            "- terminal `shared cmd` → exit 1"]
+    new = ["- terminal `shared cmd` → exit 0", "- terminal `new cmd` → exit 0"]
+    merged = MechanicalDigestEngine._merge_tool_lines(prev, new)
+    assert merged[0] == _elision_marker(7)
+    assert "- terminal `old cmd` → exit 0" in merged
+    # newest wins on the shared identity
+    assert "- terminal `shared cmd` → exit 0" in merged
+    assert "- terminal `shared cmd` → exit 1" not in merged
+
+
+def test_hard_cut_marker_not_reingested_as_legacy():
+    """The hard-cut marker is a rendering artifact; if a (last-resort) cut
+    ever lands after the legacy section, self-merge must not replay the
+    marker as legacy content forever."""
+    from plugins.context_engine.mechanical import (
+        MechanicalDigestEngine, _HARD_CUT_MARKER, _SEC_LEGACY,
+    )
+    body = ("# mechanical context digest\nheader\n\n"
+            f"{_SEC_LEGACY}\nreal legacy text\n{_HARD_CUT_MARKER}\n")
+    secs = MechanicalDigestEngine._parse_own_digest(body)
+    assert secs[_SEC_LEGACY] == ["real legacy text"]
+
+
 def test_all_floors_render_fits_minimum_budget(engine):
     """Convergence invariant behind the 'hard cut is unreachable' claim: a
     render with every section populated at worst-case item sizes must fit the
