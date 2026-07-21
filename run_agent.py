@@ -5677,6 +5677,18 @@ class AIAgent:
             # differently and wastes the prefill. Skip.
             return
 
+        # Snapshot the history BEFORE the thread starts: the caller hands us
+        # the live conversation list, and the per-message scrub below (and
+        # tool-call sanitation) touches nested structures. Sharing those with
+        # a main loop that has already moved on is a data race against the
+        # real conversation, not just a wasted prefill.
+        import copy
+        try:
+            messages = copy.deepcopy(messages)
+        except Exception:
+            logger.debug("compression warmup: history snapshot failed — skipped")
+            return
+
         def _warm() -> None:
             from agent.chat_completion_helpers import build_api_kwargs
             from agent.local_runtime import (

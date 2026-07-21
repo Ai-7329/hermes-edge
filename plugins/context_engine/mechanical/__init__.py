@@ -64,10 +64,14 @@ _SEC_POSITION = "## Current position"
 _SEC_LEGACY = "## Inherited summary (pre-mechanical, opaque)"
 _ALL_SECTIONS = (_SEC_USER, _SEC_SPINE, _SEC_TOOLS, _SEC_POSITION, _SEC_LEGACY)
 
-# Per-item and per-section shape limits.  These are content-shape constants,
-# not tuning knobs: verbatim cap keeps a single pasted wall-of-text from
-# eating the whole budget; section caps bound worst-case list growth before
-# the global char budget applies.
+# Per-item and per-section shape limits.  Upper bounds only — the effective
+# per-digest values scale DOWN with the char budget (see ``_shape()``) so a
+# small summary budget (tiny context / compression.budget_tokens) can never
+# be structurally smaller than the shapes it must hold.  That mismatch was
+# a real failure: with the edge profile (budget_tokens: 32768 → ~4.9K-char
+# budget) the fixed shapes overflowed every digest, the tail hard-cut then
+# amputated the tool index / current position, and self-merge re-ingested
+# the truncated digest so recent turns were lost permanently and silently.
 _USER_VERBATIM_MAX = 400
 _USER_HEAD_KEEP = 6          # oldest user turns kept when the section is elided
 _USER_MAX = 60
@@ -79,6 +83,24 @@ _TOOL_ARG_HEAD = 160
 _TOOLS_MAX = 60
 _LEGACY_HEAD = 1500
 _POSITION_HEAD = 300
+
+# Char-budget bounds and section shares.  Floor 6000: the minimal digest
+# (head-kept users + section floors + chrome) must always fit WITHOUT the
+# last-resort hard cut — see the convergence test.  Shares apportion the
+# budget so no section can starve the others: stale verbatim user quotes
+# must never crowd out the tool index / current position (the anti-amnesia
+# core this engine exists for).
+_BUDGET_MIN = 6000
+_BUDGET_MAX = 24000
+_SHARES_WITH_LEGACY = {"users": 0.38, "spine": 0.18, "tools": 0.26, "legacy": 0.18}
+_SHARES_NO_LEGACY = {"users": 0.44, "spine": 0.22, "tools": 0.34}
+# Absolute per-section item floors: below these a section stops shrinking
+# and the global pass moves on (their combined worst-case size fits inside
+# _BUDGET_MIN by construction).
+_FLOOR_USERS = 2   # in addition to head_keep
+_FLOOR_SPINE = 3
+_FLOOR_TOOLS = 4
+_ELIDE_MARKER_COST = 90      # rendered marker line size, for fit arithmetic
 
 _ELIDE_RE = re.compile(r"^- … (\d+) earlier item\(s\) elided")
 
@@ -252,6 +274,26 @@ class MechanicalDigestEngine(ContextCompressor):
         self._previous_summary = body
         return self._with_summary_prefix(body)
 
+    # -- Budget-proportional shape -------------------------------------------
+
+    def _shape(self) -> Dict[str, int]:
+        """Effective shape limits for the current char budget.
+
+        The budget derives from the inherited summary token budget (recomputed
+        by ``update_model``), so it tracks the real window — including a
+        ``compression.budget_tokens`` working-set cap.  Every shape limit
+        scales with it: a digest's fixed shapes must never be allowed to
+        exceed the space the digest is given.
+        """
+        budget = max(_BUDGET_MIN, min(_BUDGET_MAX, int(self.max_summary_tokens * 3)))
+        return {
+            "budget": budget,
+            # 6000 → 250-char verbatim quotes, 24000 → the full 400.
+            "user_verbatim": max(160, min(_USER_VERBATIM_MAX, budget // 24)),
+            # 6000 → keep the 4 oldest contracts, 24000 → 6.
+            "user_head_keep": max(2, min(_USER_HEAD_KEEP, budget // 1500)),
+        }
+
     # -- Extraction ----------------------------------------------------------
 
     def _build_digest(
@@ -259,6 +301,8 @@ class MechanicalDigestEngine(ContextCompressor):
         turns: List[Dict[str, Any]],
         focus_topic: Optional[str],
     ) -> str:
+        shape = self._shape()
+        user_verbatim_max = shape["user_verbatim"]
         users: List[str] = []
         spine: List[str] = []
         position = ""
@@ -277,8 +321,8 @@ class MechanicalDigestEngine(ContextCompressor):
                 if not text:
                     continue
                 flat = " ".join(text.split())
-                if len(flat) > _USER_VERBATIM_MAX:
-                    kept = flat[:_USER_VERBATIM_MAX].rstrip()
+                if len(flat) > user_verbatim_max:
+                    kept = flat[:user_verbatim_max].rstrip()
                     users.append(
                         f"- 「{kept}」 [+{len(flat) - len(kept)} chars in session DB]"
                     )
@@ -332,7 +376,9 @@ class MechanicalDigestEngine(ContextCompressor):
             else:
                 legacy_block = _single_line(prev, _LEGACY_HEAD)
 
-        users = self._elide(users, _USER_MAX, focus_topic, head_keep=_USER_HEAD_KEEP)
+        users = self._elide(
+            users, _USER_MAX, focus_topic, head_keep=shape["user_head_keep"],
+        )
         spine = self._elide(spine, _SPINE_MAX, focus_topic)
         tool_lines = self._elide(tool_lines, _TOOLS_MAX, focus_topic)
 
@@ -423,6 +469,69 @@ class MechanicalDigestEngine(ContextCompressor):
             merged.insert(len(head), marker)
         return merged
 
+    # -- Char-budget fitting --------------------------------------------------
+
+    def _fit_chars(
+        self,
+        items: List[str],
+        char_cap: int,
+        floor: int,
+        focus_topic: Optional[str],
+        head_keep: int = 0,
+    ) -> List[str]:
+        """Shrink a section to *char_cap* by dropping WHOLE oldest items.
+
+        This is the budget mechanism that replaced the old tail hard-cut:
+        the cut destroyed whichever sections rendered last (the tool index
+        and current position — exactly the anti-amnesia data), and on
+        self-merge the truncated digest was re-ingested as ground truth, so
+        everything newer than the surviving head was lost permanently with
+        no marker.  Dropping whole items oldest-first keeps every section
+        alive, keeps the NEWEST content, and accounts for every dropped
+        item in one explicit elision marker — a digest must never silently
+        truncate.
+
+        Order of sacrifice within the section: non-focus items first
+        (oldest-first, after *head_keep*), then focus-pinned items
+        (pinning is a preference, the cap is the constraint).
+        """
+        carried = 0
+        real: List[str] = []
+        for line in items:
+            m = _ELIDE_RE.match(line)
+            if m:
+                carried += int(m.group(1))
+            else:
+                real.append(line)
+        topic = (focus_topic or "").casefold()
+        dropped = carried
+
+        def total() -> int:
+            return (sum(len(l) + 1 for l in real)
+                    + (_ELIDE_MARKER_COST if dropped else 0))
+
+        floor = max(floor, 1)
+        while len(real) > max(floor, head_keep) and total() > char_cap:
+            victim = None
+            for i in range(head_keep, len(real)):
+                if topic and topic in real[i].casefold():
+                    continue
+                victim = i
+                break
+            if victim is None:
+                # Everything past the head is focus-pinned — sacrifice the
+                # oldest pinned item rather than stalling above the cap.
+                victim = min(head_keep, len(real) - 1)
+            real.pop(victim)
+            dropped += 1
+        if dropped:
+            real.insert(
+                min(head_keep, len(real)),
+                f"- … {dropped} earlier item(s) elided "
+                f"(raw remains in the session DB) …",
+            )
+        return real
+
     # -- Rendering -----------------------------------------------------------
 
     def _render(
@@ -435,9 +544,9 @@ class MechanicalDigestEngine(ContextCompressor):
         n_turns: int,
         focus_topic: Optional[str],
     ) -> str:
-        # Char budget derives from the inherited summary token budget
-        # (recomputed by update_model), so it tracks the real window size.
-        budget = max(4000, min(24000, int(self.max_summary_tokens * 3)))
+        shape = self._shape()
+        budget = shape["budget"]
+        head_keep = shape["user_head_keep"]
 
         def render_once() -> str:
             parts = [
@@ -474,24 +583,86 @@ class MechanicalDigestEngine(ContextCompressor):
             ]
             return "\n".join(parts)
 
+        # Phase 1 — apportion the budget across sections by fixed shares so
+        # no section can starve the others (a wall of stale verbatim user
+        # quotes must never crowd out the tool index / current position).
+        # Chrome (header, section titles, position, footer) is measured, not
+        # guessed, by rendering with the lists emptied.
+        _u, _s, _t, _l = users, spine, tool_lines, legacy_block
+        users, spine, tool_lines, legacy_block = [], [], [], ""
+        chrome = len(render_once()) + (len(_SEC_LEGACY) + 2 if _l else 0)
+        users, spine, tool_lines, legacy_block = _u, _s, _t, _l
+        avail = max(budget - chrome, 1000)
+        shares = _SHARES_WITH_LEGACY if legacy_block else _SHARES_NO_LEGACY
+
+        if legacy_block:
+            legacy_block = _single_line(
+                legacy_block, max(200, int(avail * shares["legacy"])),
+            )
+        users = self._fit_chars(
+            users, int(avail * shares["users"]),
+            head_keep + _FLOOR_USERS, focus_topic, head_keep=head_keep,
+        )
+        spine = self._fit_chars(
+            spine, int(avail * shares["spine"]), _FLOOR_SPINE, focus_topic,
+        )
+        tool_lines = self._fit_chars(
+            tool_lines, int(avail * shares["tools"]), _FLOOR_TOOLS, focus_topic,
+        )
+
+        # Phase 2 — mop-up: markers and rounding can leave a small overshoot;
+        # unused share (an empty section) is simply headroom.  Shrink the
+        # largest still-shrinkable section toward its absolute floor.  Each
+        # pass drops at least one whole item, so this terminates.
+        def _real_len(ls: List[str]) -> int:
+            return sum(1 for l in ls if not _ELIDE_RE.match(l))
+
         body = render_once()
-        # Budget enforcement: shrink lists oldest-first (spine → tools → users)
-        # before ever hard-cutting text.  Loop variant: each pass must strictly
-        # shrink the section — a section that cannot shrink further (floor
-        # reached modulo the elision marker) falls through to the hard cut.
-        shrink_order = [
-            (spine, 12, 0), (tool_lines, 20, 0), (users, 20, _USER_HEAD_KEEP),
-        ]
-        for lst, floor, head_keep in shrink_order:
-            while len(body) > budget and len(lst) > floor:
-                reduced = self._elide(lst, max(floor, len(lst) - 10),
-                                      focus_topic, head_keep=head_keep)
-                if len(reduced) >= len(lst):
+        while len(body) > budget:
+            candidates = [
+                (sum(len(l) for l in spine), "spine"),
+                (sum(len(l) for l in tool_lines), "tools"),
+                (sum(len(l) for l in users), "users"),
+            ]
+            candidates.sort(reverse=True)
+            for _, name in candidates:
+                if name == "spine" and _real_len(spine) > 1:
+                    spine = self._fit_chars(
+                        spine, sum(len(l) for l in spine) * 3 // 4, 1, focus_topic,
+                    )
                     break
-                lst[:] = reduced
-                body = render_once()
+                if name == "tools" and _real_len(tool_lines) > 1:
+                    tool_lines = self._fit_chars(
+                        tool_lines, sum(len(l) for l in tool_lines) * 3 // 4,
+                        1, focus_topic,
+                    )
+                    break
+                if name == "users" and _real_len(users) > 2:
+                    users = self._fit_chars(
+                        users, sum(len(l) for l in users) * 3 // 4, 2,
+                        focus_topic, head_keep=min(head_keep, 2),
+                    )
+                    break
+            else:
+                if len(legacy_block) > 200:
+                    legacy_block = _single_line(legacy_block, len(legacy_block) // 2)
+                else:
+                    break  # nothing left to shrink — fall through to last resort
+            body = render_once()
+
+        # Last resort — structurally unreachable (the all-floors render fits
+        # inside _BUDGET_MIN by construction; pinned by test), kept as a
+        # never-overflow guarantee.  Cut at a line boundary so no half-item
+        # can be re-ingested as content on self-merge.
         if len(body) > budget:
-            body = body[:budget].rstrip() + "\n… [digest hard-cut to budget]"
+            logger.warning(
+                "mechanical digest exceeded budget at section floors "
+                "(%d > %d) — hard-cutting at line boundary",
+                len(body), budget,
+            )
+            cut = body[:budget]
+            cut = cut[: cut.rfind("\n")] if "\n" in cut else cut
+            body = cut.rstrip() + "\n… [digest hard-cut to budget]"
         return body
 
 
