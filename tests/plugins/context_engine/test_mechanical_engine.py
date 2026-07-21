@@ -160,21 +160,111 @@ def test_render_terminates_when_focus_pins_every_line(engine):
     users = [f"- 「probe request {i} : " + "u" * 150 + "」" for i in range(60)]
     spine = [f"- probe report {i} : " + "s" * 200 for i in range(40)]
     tools = [f"- terminal `probe cmd {i}` → exit 0" for i in range(60)]
-    engine.max_summary_tokens = 1000  # char budget floor: 4000
+    engine.max_summary_tokens = 1000  # char budget floor: 6000
     body = _render_in_thread(engine, users, spine, tools, focus_topic="probe")
-    assert len(body) <= 4000 + 50  # budget + hard-cut suffix
+    assert len(body) <= 6000
 
 
 def test_render_terminates_at_section_floors_without_focus(engine):
-    """Small summary budgets (tiny-context models) can leave the body above
-    budget with every section at its floor; the loop must fall through to
-    the hard cut instead of re-eliding a floor-sized list forever."""
+    """A small summary budget with oversized sections must converge by
+    whole-item elision — never by the last-resort hard cut."""
     users = [f"- 「turn {i} : " + "u" * 370 + "」" for i in range(60)]
     spine = [f"- report {i} : " + "s" * 200 for i in range(40)]
     tools = [f"- terminal `cmd {i}` → exit 0, output 3 chars" for i in range(60)]
     engine.max_summary_tokens = 1000
     body = _render_in_thread(engine, users, spine, tools, focus_topic=None)
-    assert len(body) <= 4000 + 50
+    assert len(body) <= 6000
+    assert "hard-cut" not in body
+
+
+# ---------------------------------------------------------------------------
+# Regressions for the edge-profile digest collapse: with a small char budget
+# (compression.budget_tokens shrinks max_summary_tokens) the old renderer
+# tail-hard-cut every digest from the 2nd compaction on — amputating the tool
+# index and current position — and self-merge then re-ingested the truncated
+# digest, so all recent user turns were lost permanently with no marker.
+# ---------------------------------------------------------------------------
+
+_ALL_SECTION_HEADERS = (
+    "## User turns", "## Assistant report spine",
+    "## Tool execution index", "## Current position",
+)
+
+
+def _long_session_window(base, n_turns=40):
+    """One compression window of a busy session: user contracts + reports +
+    tool traffic, sized like real edge traffic (tool_output.max_bytes ≈ 6KB)."""
+    msgs = []
+    for i in range(base, base + n_turns):
+        if i % 4 == 0:
+            msgs.append({"role": "user",
+                         "content": f"タスク{i}: group_{i % 7}.py を修正して。" + "要件詳細。" * 30})
+        msgs.append({"role": "assistant",
+                     "content": f"ターン{i}の分析結果。" + "解析内容。" * 40,
+                     "tool_calls": [_tool_call(f"e{i}", "terminal",
+                                               command=f"pytest tests/group_{i % 7}.py -x")]})
+        msgs.append({"role": "tool", "tool_call_id": f"e{i}",
+                     "content": json.dumps({"output": f"output {i} " * 120,
+                                            "exit_code": i % 3 and 1 or 0})})
+        msgs.append({"role": "assistant",
+                     "content": f"ターン{i}の結論: group_{i % 7} を更新済み。" + "状態説明。" * 20})
+    return msgs
+
+
+def test_small_budget_digest_keeps_every_section(engine):
+    """Edge profile shape: budget_tokens: 32768 → max_summary_tokens 1638.
+    Every section must survive within budget with no hard cut."""
+    engine.max_summary_tokens = 1638
+    digest = engine._generate_summary(_long_session_window(0, 60))
+    budget = engine._shape()["budget"]
+    for sec in _ALL_SECTION_HEADERS:
+        assert sec in digest, f"{sec} amputated from small-budget digest"
+    assert "hard-cut" not in digest
+    body = digest.split("# mechanical context digest", 1)[1]
+    assert len(body) <= budget
+
+
+def test_small_budget_self_merge_keeps_newest_and_marks_elision(engine):
+    """The collapse attractor: under repeated self-merge the old renderer
+    converged to a wall of the OLDEST user turns and silently destroyed
+    everything newer.  After the fix, the newest turns must survive every
+    cycle, all sections must stay present, and any dropped items must be
+    accounted for by an explicit elision marker."""
+    import re
+    engine.max_summary_tokens = 1638
+    digest = None
+    for cycle in range(8):
+        digest = engine._generate_summary(_long_session_window(cycle * 40))
+    latest_task = 7 * 40 + 36  # newest user turn of the final window
+    assert f"タスク{latest_task}:" in digest, "newest user turn lost on self-merge"
+    for sec in _ALL_SECTION_HEADERS:
+        assert sec in digest
+    assert "hard-cut" not in digest
+    # 80 user turns were ingested across cycles; whatever no longer fits must
+    # be declared, not silently dropped.
+    user_sec = digest.split("## User turns", 1)[1].split("## ", 1)[0]
+    kept = len(re.findall(r"タスク(\d+):", user_sec))
+    elided = sum(int(n) for n in re.findall(r"(\d+) earlier item\(s\) elided", user_sec))
+    assert kept + elided == 80, f"user turns unaccounted: kept={kept} elided={elided}"
+    # the oldest contracts stay pinned at the head (head_keep)
+    assert "タスク0:" in user_sec
+
+
+def test_all_floors_render_fits_minimum_budget(engine):
+    """Convergence invariant behind the 'hard cut is unreachable' claim: a
+    render with every section populated at worst-case item sizes must fit the
+    minimum budget via whole-item elision alone."""
+    engine.max_summary_tokens = 1  # forces the 6000-char budget floor
+    users = [f"- 「{'う' * 398}」" for _ in range(60)]
+    spine = [f"- {'す' * 248}" for _ in range(40)]
+    tools = [f"- terminal `{'c' * 158}` → {'o' * 118}  (×9 runs, latest shown)"
+             for _ in range(60)]
+    body = engine._render(users, spine, tools, position="p" * 300,
+                          legacy_block="l" * 1500, n_turns=99, focus_topic=None)
+    assert len(body) <= 6000
+    assert "hard-cut" not in body
+    for sec in _ALL_SECTION_HEADERS:
+        assert sec in body
 
 
 def test_placeholder_lines_do_not_accumulate_across_digests(engine):
