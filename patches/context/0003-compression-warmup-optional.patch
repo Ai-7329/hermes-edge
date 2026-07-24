@@ -1,0 +1,839 @@
+diff --git a/run_agent.py b/run_agent.py
+index 2209a1c..f690e06 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -5615,11 +5615,145 @@ class AIAgent:
+         ``force=False``.
+         """
+         from agent.conversation_compression import compress_context
+-        return compress_context(
++        _pre_count = getattr(
++            getattr(self, "context_compressor", None), "compression_count", None,
++        )
++        result = compress_context(
+             self, messages, system_message,
+             approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
+             force=force,
+         )
++        # Post-compaction cache warmup (edge): compaction rewrites history, so
++        # the next call re-prefills the whole rewritten prompt — minutes at
++        # local prefill speeds. When the operator opted in, pay that prefill
++        # NOW, in idle time between turns, instead of at the start of the
++        # user's next message. Fire-and-forget; never affects the result.
++        try:
++            _post_count = getattr(
++                getattr(self, "context_compressor", None), "compression_count", None,
++            )
++            if (
++                isinstance(_pre_count, int)
++                and isinstance(_post_count, int)
++                and _post_count > _pre_count
++            ):
++                self._maybe_schedule_compression_warmup(result[0], result[1])
++        except Exception as _warm_err:
++            logger.debug("compression warmup scheduling skipped: %s", _warm_err)
++        return result
++
++    def _maybe_schedule_compression_warmup(self, messages: list, system_message: str) -> None:
++        """Prefill the post-compaction prompt into the local server's cache.
++
++        Sends a single-token request carrying the same system prompt, tools
++        and compressed history the next real call will send, so the server
++        rebuilds its prefix cache while the session is idle. Guarded by
++        ``local_runtime.compression_warmup`` and only offered under the
++        single-flight gate: the warmup runs with skip-when-busy semantics, so
++        any concurrent real request wins and the warmup silently steps aside.
++
++        Best-effort byte fidelity: the message scrub below mirrors the main
++        loop's per-message sanitation (conversation_loop's api_messages
++        assembly). If the prompts diverge the cost is one wasted idle-time
++        prefill, never a wrong conversation.
++        """
++        from agent.local_runtime import compression_warmup_enabled
++
++        if not compression_warmup_enabled(getattr(self, "base_url", "") or ""):
++            return
++        if self.api_mode in ("codex_responses", "anthropic_messages", "bedrock_converse"):
++            return
++        if getattr(self, "ephemeral_system_prompt", None) or getattr(self, "prefill_messages", None):
++            # These are injected at real-call time and would sit between the
++            # system prompt and history — a warmup without them prefixes
++            # differently and wastes the prefill. Skip.
++            return
++
++        # Snapshot the history BEFORE the thread starts: the caller hands us
++        # the live conversation list, and the per-message scrub below (and
++        # tool-call sanitation) touches nested structures. Sharing those with
++        # a main loop that has already moved on is a data race against the
++        # real conversation, not just a wasted prefill.
++        import copy
++        try:
++            messages = copy.deepcopy(messages)
++        except Exception:
++            logger.debug("compression warmup: history snapshot failed — skipped")
++            return
++
++        def _warm() -> None:
++            from agent.chat_completion_helpers import build_api_kwargs
++            from agent.local_runtime import (
++                EndpointGate,
++                GateBusyError,
++                estimate_messages_tokens,
++                prefill_floor_seconds,
++                set_task_label,
++            )
++
++            # Grace period: after a PREFLIGHT compaction the real call follows
++            # within milliseconds — it must win the gate, not queue behind an
++            # opportunistic warmup (observed live: main waited 26s for a
++            # warmup whose bytes then diverged). Two idle seconds cost the
++            # post-response case nothing and let the imminent-call case turn
++            # into a clean skip-when-busy.
++            time.sleep(2.0)
++            set_task_label("compression_warmup")
++            client = None
++            try:
++                api_messages = []
++                for msg in messages:
++                    api_msg = dict(msg)
++                    api_msg.pop("reasoning", None)
++                    api_msg.pop("finish_reason", None)
++                    api_msg.pop("_thinking_prefill", None)
++                    if self._should_sanitize_tool_calls():
++                        self._sanitize_tool_calls_for_strict_api(api_msg, model=self.model)
++                    api_messages.append(api_msg)
++                if system_message:
++                    api_messages = [{"role": "system", "content": system_message}] + api_messages
++                api_messages = self._sanitize_api_messages(api_messages)
++                api_messages = self._drop_thinking_only_and_merge_users(
++                    api_messages,
++                    drop_codex_reasoning_items=self.api_mode != "codex_responses",
++                )
++                for am in api_messages:
++                    if isinstance(am.get("content"), str):
++                        am["content"] = am["content"].strip()
++
++                warm_kwargs = build_api_kwargs(self, api_messages)
++                for _mt_key in ("max_tokens", "max_completion_tokens"):
++                    if _mt_key in warm_kwargs:
++                        warm_kwargs[_mt_key] = 1
++                warm_kwargs.pop("stream", None)
++                warm_kwargs.pop("stream_options", None)
++                _floor = prefill_floor_seconds(estimate_messages_tokens(api_messages))
++                if _floor is not None:
++                    warm_kwargs["timeout"] = _floor + 60.0
++
++                with EndpointGate(self.base_url, purpose="compression_warmup"):
++                    client = self._create_request_openai_client(
++                        reason="compression_warmup", api_kwargs=warm_kwargs,
++                    )
++                    client.chat.completions.create(**warm_kwargs)
++                logger.info(
++                    "compression warmup: post-compaction prompt (%d messages) "
++                    "re-prefilled into local cache", len(api_messages),
++                )
++            except GateBusyError:
++                logger.debug("compression warmup: endpoint busy — skipped")
++            except Exception as warm_exc:
++                logger.debug("compression warmup failed (harmless): %s", warm_exc)
++            finally:
++                if client is not None:
++                    try:
++                        self._close_request_openai_client(client, reason="compression_warmup_done")
++                    except Exception:
++                        pass
++
++        threading.Thread(
++            target=_warm, name="hermes-compression-warmup", daemon=True,
++        ).start()
+ 
+     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
+         """Record the first guardrail decision that should stop this turn."""
+diff --git a/agent/local_runtime.py b/agent/local_runtime.py
+new file mode 100644
+index 0000000..245df7b
+--- /dev/null
++++ b/agent/local_runtime.py
+@@ -0,0 +1,494 @@
++"""Local-runtime governance for slow shared backends (edge fork).
++
++Cloud providers absorb concurrency; a llama.cpp/Ollama/vLLM server on the
++same low-spec box does not.  Two structural failure modes follow when the
++agent treats a local endpoint like a cloud one:
++
++1. **Cache eviction by interleaving.**  Auxiliary calls (title generation,
++   background review, memory flush, ...) race the main conversation to the
++   same server.  On backends whose prefix cache restores only from
++   checkpoints (SWA / hybrid-attention models), losing the slot to an
++   auxiliary request forces a full re-prefill of the main conversation —
++   minutes of wall clock at local prefill speeds.
++
++2. **Structurally unwinnable timeouts.**  Static timeout defaults assume
++   cloud prefill latency.  At tens of tokens/second, any request carrying
++   more than ``timeout × prefill_tps`` tokens loses before it starts — and
++   because the client gives up while the server keeps crunching, the retry
++   piles onto a busy server and loses again.
++
++This module provides the two counter-mechanisms, both opt-in and both
++inert for non-local endpoints:
++
++* An **endpoint gate**: at most one in-flight request per governed (local)
++  endpoint.  Fire-and-forget auxiliary tasks skip when the gate is busy
++  instead of queueing; interactive work waits.  Reentrant per thread so
++  wrapped call paths that fall back into each other (streaming →
++  non-streaming) cannot self-deadlock.  Fail-open: a gate wait that
++  exceeds its budget proceeds without exclusivity rather than wedging.
++
++* **Prefill-aware timeout floors**: deadlines derived from request size and
++  a measured prompt-processing speed (``prefill_tps``), replacing both the
++  too-small static auxiliary defaults and the unbounded "local endpoints
++  never go stale" escape hatch — a wedged server must still be detected in
++  bounded time for unattended long-running operation.
++
++Config (all optional, under a top-level ``local_runtime:`` section)::
++
++    local_runtime:
++      single_flight: true        # serialize requests per local endpoint
++      gate_wait_timeout: 900     # seconds a blocking caller waits for the gate
++      busy_skip_wait: 15         # seconds a skippable task waits before skipping
++      gate_skip_when_busy:       # aux task names that skip instead of queue
++        - title_generation
++        - background_review
++        - curator
++        - profile_describer
++        - tts_audio_tags
++      gate_hosts: []             # extra hostnames to govern (beyond auto-local)
++      prefill_tps: 50            # measured prompt tok/s of the backend; 0 = off
++      decode_budget: 900         # max expected generation seconds (stale bound)
++      timeout_margin: 30         # fixed slack added to computed floors
++
++``single_flight`` and ``prefill_tps`` are independent: either can be enabled
++without the other.
++"""
++
++from __future__ import annotations
++
++import contextvars
++import json
++import logging
++import threading
++import time
++from typing import Any, Dict, Iterable, Optional
++from urllib.parse import urlparse
++
++logger = logging.getLogger(__name__)
++
++# Task label for the current logical operation (set by auxiliary call paths,
++# read by the gated client wrapper to decide queue-vs-skip and for logging).
++# A context variable rather than a parameter because the wrapped OpenAI
++# client's ``create()`` signature cannot carry hermes-specific arguments.
++_TASK_LABEL: contextvars.ContextVar[str] = contextvars.ContextVar(
++    "hermes_local_runtime_task", default=""
++)
++
++_DEFAULT_SKIP_WHEN_BUSY = (
++    "title_generation",
++    "background_review",
++    "curator",
++    "profile_describer",
++    "tts_audio_tags",
++    # Post-compaction cache warmup is pure opportunism: if the main
++    # conversation (or anything else) is already talking to the server,
++    # the warmup's job is being done by that request — skip, never queue.
++    "compression_warmup",
++)
++
++# Approximate bytes-per-token for mixed prose / code / JSON payloads.  Used
++# only for timeout floors (safety margins absorb the error), never for
++# billing or context-window math.
++_CHARS_PER_TOKEN = 3.5
++
++
++def set_task_label(label: str) -> None:
++    """Record the auxiliary task driving subsequent LLM calls on this thread.
++
++    Deliberately not scoped/reset: every auxiliary entry point sets its own
++    label on entry, so a stale value can only mislabel logging between calls,
++    never gate semantics for the main conversation (which passes an explicit
++    purpose).
++    """
++    try:
++        _TASK_LABEL.set(str(label or ""))
++    except Exception:
++        pass
++
++
++def current_task_label() -> str:
++    try:
++        return _TASK_LABEL.get()
++    except Exception:
++        return ""
++
++
++# ---------------------------------------------------------------------------
++# Config access
++# ---------------------------------------------------------------------------
++
++
++def _read_cfg() -> Dict[str, Any]:
++    """Return the ``local_runtime`` config section (cached upstream)."""
++    try:
++        from hermes_cli.config import load_config_readonly
++
++        cfg = load_config_readonly()
++    except Exception:
++        return {}
++    section = cfg.get("local_runtime") if isinstance(cfg, dict) else None
++    return section if isinstance(section, dict) else {}
++
++
++def _cfg_float(key: str, default: float) -> float:
++    raw = _read_cfg().get(key, default)
++    try:
++        value = float(raw)
++    except (TypeError, ValueError):
++        return default
++    return value
++
++
++def single_flight_enabled() -> bool:
++    return bool(_read_cfg().get("single_flight", False))
++
++
++def prefill_tps() -> Optional[float]:
++    """Measured prompt-processing speed of the local backend, tok/s.
++
++    Returns ``None`` when unset or non-positive — every consumer treats
++    that as "feature off, keep upstream behavior".
++    """
++    raw = _read_cfg().get("prefill_tps", 0)
++    try:
++        tps = float(raw)
++    except (TypeError, ValueError):
++        return None
++    return tps if tps > 0 else None
++
++
++def _timeout_margin() -> float:
++    return max(_cfg_float("timeout_margin", 30.0), 0.0)
++
++
++def _decode_budget() -> float:
++    return max(_cfg_float("decode_budget", 900.0), 0.0)
++
++
++def _gate_wait_timeout() -> float:
++    return max(_cfg_float("gate_wait_timeout", 900.0), 1.0)
++
++
++def _busy_skip_wait() -> float:
++    return max(_cfg_float("busy_skip_wait", 15.0), 0.0)
++
++
++def _skip_when_busy_tasks() -> frozenset:
++    raw = _read_cfg().get("gate_skip_when_busy", None)
++    if isinstance(raw, (list, tuple)):
++        return frozenset(str(item).strip() for item in raw if str(item).strip())
++    return frozenset(_DEFAULT_SKIP_WHEN_BUSY)
++
++
++def _extra_gate_hosts() -> frozenset:
++    raw = _read_cfg().get("gate_hosts", None)
++    if isinstance(raw, (list, tuple)):
++        return frozenset(str(item).strip().lower() for item in raw if str(item).strip())
++    return frozenset()
++
++
++# ---------------------------------------------------------------------------
++# Endpoint gate
++# ---------------------------------------------------------------------------
++
++
++class GateBusyError(RuntimeError):
++    """A skippable auxiliary task found the local endpoint busy.
++
++    Raised instead of issuing the HTTP request at all, so the busy backend
++    never sees (and never has its prefix cache disturbed by) a request the
++    caller was willing to drop.  Callers treat it like any transient
++    auxiliary failure.
++    """
++
++    def __init__(self, host: str, task: str, waited: float):
++        super().__init__(
++            f"local endpoint {host} busy after {waited:.1f}s — "
++            f"skipping deferrable task {task or 'aux'!r}"
++        )
++        self.host = host
++        self.task = task
++
++
++def _host_key(base_url: str) -> str:
++    """Normalize a base URL to a host:port gate key."""
++    raw = str(base_url or "").strip()
++    if not raw:
++        return ""
++    url = raw if "://" in raw else f"http://{raw}"
++    try:
++        parsed = urlparse(url)
++    except Exception:
++        return raw.lower()
++    host = (parsed.hostname or "").lower()
++    if not host:
++        return raw.lower()
++    port = parsed.port
++    return f"{host}:{port}" if port else host
++
++
++def _is_governed_endpoint(base_url: str) -> bool:
++    key = _host_key(base_url)
++    if not key:
++        return False
++    host = key.split(":", 1)[0]
++    if host in _extra_gate_hosts():
++        return True
++    try:
++        from agent.model_metadata import is_local_endpoint
++
++        return bool(is_local_endpoint(base_url))
++    except Exception:
++        return False
++
++
++_LOCKS_GUARD = threading.Lock()
++_LOCKS: Dict[str, threading.RLock] = {}
++
++
++def _lock_for(key: str) -> threading.RLock:
++    with _LOCKS_GUARD:
++        lock = _LOCKS.get(key)
++        if lock is None:
++            lock = threading.RLock()
++            _LOCKS[key] = lock
++        return lock
++
++
++class EndpointGate:
++    """Context manager holding the single-flight lock for one request.
++
++    No-op (but still a valid context manager) when governance is off or the
++    endpoint is not local.  Reentrant per thread via ``threading.RLock`` —
++    nested call paths (streaming falling back to non-streaming, codex
++    delegation) re-enter without deadlock.
++    """
++
++    def __init__(self, base_url: str, *, purpose: str = "", wait_timeout: Optional[float] = None):
++        self._purpose = purpose or current_task_label() or "call"
++        self._wait_timeout = wait_timeout
++        self._lock: Optional[threading.RLock] = None
++        self._acquired = False
++        self._key = ""
++        if single_flight_enabled() and _is_governed_endpoint(base_url):
++            self._key = _host_key(base_url)
++            self._lock = _lock_for(self._key)
++
++    def __enter__(self) -> "EndpointGate":
++        if self._lock is None:
++            return self
++        skippable = self._purpose in _skip_when_busy_tasks()
++        budget = self._wait_timeout
++        if budget is None:
++            budget = _busy_skip_wait() if skippable else _gate_wait_timeout()
++        started = time.monotonic()
++        self._acquired = self._lock.acquire(timeout=max(budget, 0.0))
++        waited = time.monotonic() - started
++        if not self._acquired:
++            if skippable:
++                raise GateBusyError(self._key, self._purpose, waited)
++            # Fail open: exclusivity is an optimization, wedging the
++            # conversation is not an acceptable price for it.
++            logger.warning(
++                "endpoint gate: %s waited %.0fs for %s without acquiring — "
++                "proceeding without exclusivity",
++                self._purpose, waited, self._key,
++            )
++            return self
++        if waited > 1.0:
++            logger.info(
++                "endpoint gate: %s waited %.1fs for %s", self._purpose, waited, self._key
++            )
++        return self
++
++    def __exit__(self, exc_type, exc, tb) -> bool:
++        self.release()
++        return False
++
++    def release(self) -> None:
++        if self._acquired and self._lock is not None:
++            self._acquired = False
++            try:
++                self._lock.release()
++            except RuntimeError:
++                logger.debug("endpoint gate: release without ownership for %s", self._key)
++
++
++def endpoint_gate(base_url: str, *, purpose: str = "", wait_timeout: Optional[float] = None) -> EndpointGate:
++    """Build the single-flight gate for ``base_url`` (no-op when ungoverned)."""
++    return EndpointGate(base_url, purpose=purpose, wait_timeout=wait_timeout)
++
++
++class _GatedStream:
++    """Stream proxy that holds the endpoint gate until the stream ends.
++
++    A streaming ``create()`` returns before generation finishes; releasing
++    the gate at that point would let another request preempt the slot
++    mid-generation.  The proxy releases exactly once — on exhaustion, on
++    error, on ``close()``, on context-manager exit, or at GC as a backstop.
++    """
++
++    def __init__(self, stream: Any, gate: EndpointGate):
++        self._stream = stream
++        self._gate = gate
++
++    def __iter__(self):
++        try:
++            for chunk in self._stream:
++                yield chunk
++        finally:
++            self._release()
++
++    def __enter__(self):
++        entered = getattr(self._stream, "__enter__", None)
++        if entered is not None:
++            entered()
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        try:
++            exiter = getattr(self._stream, "__exit__", None)
++            if exiter is not None:
++                return bool(exiter(exc_type, exc, tb))
++            return False
++        finally:
++            self._release()
++
++    def close(self):
++        try:
++            closer = getattr(self._stream, "close", None)
++            if closer is not None:
++                closer()
++        finally:
++            self._release()
++
++    def _release(self):
++        gate, self._gate = self._gate, None
++        if gate is not None:
++            gate.release()
++
++    def __getattr__(self, name):
++        return getattr(self._stream, name)
++
++    def __del__(self):
++        try:
++            self._release()
++        except Exception:
++            pass
++
++
++def gate_openai_client(client: Any, base_url: str) -> Any:
++    """Wrap an OpenAI-compatible client so ``chat.completions.create`` is gated.
++
++    Idempotent; returns the client unchanged when wrapping is impossible or
++    the endpoint is never governed.  The gate decision itself is re-evaluated
++    per call (config is live), so a wrapped client on a disabled config is a
++    plain passthrough.
++    """
++    if client is None:
++        return client
++    try:
++        completions = client.chat.completions
++        if getattr(completions, "_hermes_gate_wrapped", False):
++            return client
++        original_create = completions.create
++    except Exception:
++        return client
++
++    def _gated_create(*args: Any, **kwargs: Any) -> Any:
++        gate = EndpointGate(base_url, purpose=current_task_label() or "aux")
++        gate.__enter__()
++        try:
++            response = original_create(*args, **kwargs)
++        except BaseException:
++            gate.release()
++            raise
++        if kwargs.get("stream"):
++            return _GatedStream(response, gate)
++        gate.release()
++        return response
++
++    try:
++        completions.create = _gated_create
++        completions._hermes_gate_wrapped = True
++    except Exception:
++        return client
++    return client
++
++
++# ---------------------------------------------------------------------------
++# Prefill-aware timeout floors
++# ---------------------------------------------------------------------------
++
++
++def estimate_messages_tokens(messages: Optional[Iterable[Any]]) -> int:
++    """Cheap size estimate of a chat payload for timeout floors only."""
++    if not messages:
++        return 0
++    try:
++        text = json.dumps(list(messages), ensure_ascii=False, default=str)
++    except Exception:
++        try:
++            text = str(messages)
++        except Exception:
++            return 0
++    return int(len(text) / _CHARS_PER_TOKEN)
++
++
++def prefill_floor_seconds(est_tokens: int) -> Optional[float]:
++    """Seconds the backend legitimately needs to *prefill* ``est_tokens``.
++
++    ``None`` when ``prefill_tps`` is unconfigured (feature off).
++    """
++    tps = prefill_tps()
++    if tps is None:
++        return None
++    return _timeout_margin() + max(int(est_tokens), 0) / tps
++
++
++def local_aux_timeout_floor(base_url: str, messages: Optional[Iterable[Any]]) -> Optional[float]:
++    """Timeout floor for an auxiliary call against a governed local endpoint.
++
++    Static auxiliary defaults assume cloud prefill.  Locally the request is
++    only winnable if the deadline covers its own prefill plus a response
++    budget; anything shorter is a guaranteed loss that still costs the
++    server a full prefill.  Queue wait is excluded by design — the endpoint
++    gate is acquired before the HTTP clock starts.
++    """
++    if not _is_governed_endpoint(base_url):
++        return None
++    floor = prefill_floor_seconds(estimate_messages_tokens(messages))
++    if floor is None:
++        return None
++    # Auxiliary responses are short (titles, digests, verdicts); a fixed
++    # fraction of the decode budget is plenty.
++    return floor + min(_decode_budget(), 120.0)
++
++
++def compression_warmup_enabled(base_url: str) -> bool:
++    """Whether post-compaction cache warmup may run for this endpoint.
++
++    Requires all three: the feature flag, an endpoint the gate governs, and
++    single-flight itself — the gate's skip-when-busy semantics are the only
++    thing keeping an opportunistic warmup from colliding with the user's
++    next message, so warmup without the gate is not offered.
++    """
++    if not bool(_read_cfg().get("compression_warmup", False)):
++        return False
++    return single_flight_enabled() and _is_governed_endpoint(base_url)
++
++
++def bounded_local_stale_seconds(base_url: str, est_tokens: int) -> Optional[float]:
++    """Bounded stale/TTFB deadline for a local main-conversation call.
++
++    Replaces the upstream "local endpoints never go stale" infinity: correct
++    for interactive use, wrong for unattended long-running operation where a
++    wedged server must be detected in bounded time.  The bound covers a full
++    prefill of the request plus the decode budget.
++    """
++    if not _is_governed_endpoint(base_url):
++        return None
++    floor = prefill_floor_seconds(est_tokens)
++    if floor is None:
++        return None
++    return floor + _decode_budget()
+diff --git a/tests/agent/test_compression_budget_warmup.py b/tests/agent/test_compression_budget_warmup.py
+new file mode 100644
+index 0000000..e6dac34
+--- /dev/null
++++ b/tests/agent/test_compression_budget_warmup.py
+@@ -0,0 +1,182 @@
++"""Tests for compression.budget_tokens and post-compaction cache warmup."""
++
++import threading
++from unittest.mock import patch
++
++import pytest
++
++from agent.context_compressor import ContextCompressor
++
++
++LOCAL_URL = "http://127.0.0.1:8080/v1"
++
++
++def _make_compressor(budget, *, context_length=131072, max_tokens=8192, pct=0.5):
++    cfg = {"compression": {"budget_tokens": budget}} if budget else {}
++    with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
++        return ContextCompressor(
++            model="qwen-local",
++            threshold_percent=pct,
++            config_context_length=context_length,
++            quiet_mode=True,
++            base_url=LOCAL_URL,
++            max_tokens=max_tokens,
++        )
++
++
++class TestBudgetTokens:
++    def test_budget_sets_threshold_directly(self):
++        c = _make_compressor(32768)
++        # min(budget, window - max_tokens) * pct — no MINIMUM floor, no
++        # small-context raise.
++        assert c.threshold_tokens == int(32768 * 0.5)
++        assert c.threshold_percent == 0.5
++
++    def test_no_budget_keeps_upstream_small_ctx_raise(self):
++        c = _make_compressor(0)
++        # Upstream: sub-512K windows trigger at >=75% of the input budget.
++        assert c.threshold_percent == 0.75
++        assert c.threshold_tokens == int((131072 - 8192) * 0.75)
++
++    def test_budget_clamped_to_effective_window(self):
++        c = _make_compressor(1_000_000, context_length=131072, max_tokens=8192)
++        # A budget above the window falls back to the effective window.
++        assert c.threshold_tokens == int((131072 - 8192) * 0.5)
++
++    def test_summary_ceiling_follows_budget(self):
++        c = _make_compressor(32768)
++        assert c.max_summary_tokens == int(32768 * 0.05)
++
++    def test_update_model_rereads_budget(self):
++        c = _make_compressor(32768)
++        with patch(
++            "hermes_cli.config.load_config_readonly",
++            return_value={"compression": {"budget_tokens": 16384}},
++        ):
++            c.update_model(model="qwen-local", context_length=131072)
++        assert c.threshold_tokens == int(16384 * 0.5)
++
++    def test_update_model_budget_removed_restores_upstream(self):
++        c = _make_compressor(32768)
++        with patch("hermes_cli.config.load_config_readonly", return_value={}):
++            c.update_model(model="qwen-local", context_length=131072)
++        assert c.threshold_percent == 0.75
++
++    def test_mechanical_engine_inherits_budget(self):
++        from plugins.context_engine.mechanical import MechanicalDigestEngine
++
++        cfg = {"compression": {"budget_tokens": 32768}}
++        with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
++            engine = MechanicalDigestEngine()
++            # agent_init drives plugin engines through update_model() — the
++            # budget must survive that same path.
++            engine.update_model(model="qwen-local", context_length=131072)
++        assert engine.threshold_tokens == int(32768 * 0.5)
++        assert engine.threshold_percent == 0.5
++
++
++class _WarmupAgentStub:
++    """Minimal surface for AIAgent._maybe_schedule_compression_warmup."""
++
++    base_url = LOCAL_URL
++    api_mode = "chat_completions"
++    model = "qwen-local"
++    ephemeral_system_prompt = None
++    prefill_messages = None
++
++    def __init__(self):
++        self.created = []
++        self.closed = []
++        self.done = threading.Event()
++
++    def _should_sanitize_tool_calls(self):
++        return False
++
++    def _sanitize_tool_calls_for_strict_api(self, msg, model=None):
++        return msg
++
++    def _sanitize_api_messages(self, msgs):
++        return msgs
++
++    def _drop_thinking_only_and_merge_users(self, msgs, drop_codex_reasoning_items=True):
++        return msgs
++
++    def _create_request_openai_client(self, reason="", api_kwargs=None):
++        stub = self
++
++        class _Completions:
++            @staticmethod
++            def create(**kwargs):
++                stub.created.append(kwargs)
++                stub.done.set()
++                return {"ok": True}
++
++        class _Chat:
++            completions = _Completions()
++
++        class _Client:
++            chat = _Chat()
++
++        return _Client()
++
++    def _close_request_openai_client(self, client, reason=""):
++        self.closed.append(reason)
++
++
++def _run_warmup(stub, cfg):
++    from run_agent import AIAgent
++
++    def _fake_build(agent, api_messages):
++        return {"model": agent.model, "messages": api_messages, "max_tokens": 512}
++
++    with (
++        patch("agent.local_runtime._read_cfg", return_value=cfg),
++        patch("agent.chat_completion_helpers.build_api_kwargs", _fake_build),
++    ):
++        AIAgent._maybe_schedule_compression_warmup(
++            stub,
++            [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}],
++            "SYSTEM PROMPT",
++        )
++        # The worker thread reads config too — wait inside the patch scope.
++        fired = stub.done.wait(timeout=5)
++    return fired
++
++
++class TestCompressionWarmup:
++    def test_disabled_by_default(self):
++        stub = _WarmupAgentStub()
++        fired = _run_warmup(stub, {"single_flight": True})
++        assert not fired
++        assert stub.created == []
++
++    def test_warmup_fires_single_token_request(self):
++        stub = _WarmupAgentStub()
++        cfg = {"single_flight": True, "compression_warmup": True}
++        fired = _run_warmup(stub, cfg)
++        assert fired
++        assert len(stub.created) == 1
++        kwargs = stub.created[0]
++        assert kwargs["max_tokens"] == 1
++        assert "stream" not in kwargs
++        assert kwargs["messages"][0] == {"role": "system", "content": "SYSTEM PROMPT"}
++        assert stub.closed == ["compression_warmup_done"]
++
++    def test_requires_single_flight(self):
++        stub = _WarmupAgentStub()
++        fired = _run_warmup(stub, {"compression_warmup": True})
++        assert not fired
++
++    def test_skips_with_ephemeral_system_prompt(self):
++        stub = _WarmupAgentStub()
++        stub.ephemeral_system_prompt = "extra"
++        cfg = {"single_flight": True, "compression_warmup": True}
++        fired = _run_warmup(stub, cfg)
++        assert not fired
++
++    def test_skips_non_chat_api_modes(self):
++        stub = _WarmupAgentStub()
++        stub.api_mode = "anthropic_messages"
++        cfg = {"single_flight": True, "compression_warmup": True}
++        fired = _run_warmup(stub, cfg)
++        assert not fired
